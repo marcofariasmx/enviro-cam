@@ -87,7 +87,7 @@ start_time = None
 last_history_save = 0
 
 # ESP32 state
-esp32_devices = {}  # {ip: device_data}
+esp32_devices = {}  # {mac_address: device_data}
 esp32_lock = Lock()
 last_esp32_scan = 0
 last_esp32_poll = 0
@@ -117,11 +117,12 @@ def init_database():
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_history(timestamp)')
 
-    # ESP32 devices registry
+    # ESP32 devices registry (using MAC address as unique identifier)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS esp32_devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip TEXT UNIQUE NOT NULL,
+            mac_address TEXT UNIQUE NOT NULL,
+            ip TEXT,
             device_name TEXT,
             mdns_hostname TEXT,
             firmware_version TEXT,
@@ -130,22 +131,23 @@ def init_database():
             active INTEGER DEFAULT 1
         )
     ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_mac ON esp32_devices(mac_address)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_ip ON esp32_devices(ip)')
 
-    # ESP32 sensor history
+    # ESP32 sensor history (using MAC address for device reference)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS esp32_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_ip TEXT NOT NULL,
+            device_mac TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             temperature_c REAL,
             humidity REAL,
             pressure REAL,
-            FOREIGN KEY (device_ip) REFERENCES esp32_devices(ip)
+            FOREIGN KEY (device_mac) REFERENCES esp32_devices(mac_address)
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_history_ts ON esp32_history(timestamp)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_history_device ON esp32_history(device_ip)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_history_device ON esp32_history(device_mac)')
 
     conn.commit()
     conn.close()
@@ -243,9 +245,10 @@ def probe_esp32_device(ip):
         req = urllib.request.Request(url, headers={'User-Agent': 'EnviroCam/1.0'})
         with urllib.request.urlopen(req, timeout=ESP32_TIMEOUT) as response:
             data = json.loads(response.read().decode())
-            # Check if it's an ESP32 monitor device
-            if 'firmwareVersion' in data and 'sensorTemperature' in data:
+            # Check if it's an ESP32 monitor device (must have MAC address for identification)
+            if 'firmwareVersion' in data and 'sensorTemperature' in data and 'macAddress' in data:
                 return {
+                    'mac_address': data.get('macAddress'),
                     'ip': ip,
                     'device_name': data.get('deviceName', 'Unknown'),
                     'mdns_hostname': data.get('mdnsHostname', ''),
@@ -277,8 +280,9 @@ def scan_network_for_esp32():
         for future in as_completed(futures):
             result = future.result()
             if result:
-                found_devices[result['ip']] = result
-                print(f"ESP32: Found '{result['device_name']}' at {result['ip']}")
+                # Use MAC address as the unique key
+                found_devices[result['mac_address']] = result
+                print(f"ESP32: Found '{result['device_name']}' ({result['mac_address']}) at {result['ip']}")
 
     # Update global state and database
     with esp32_lock:
@@ -294,17 +298,18 @@ def scan_network_for_esp32():
         # Mark all devices as inactive first
         cursor.execute('UPDATE esp32_devices SET active = 0')
 
-        for ip, device in found_devices.items():
+        for mac, device in found_devices.items():
             cursor.execute('''
-                INSERT INTO esp32_devices (ip, device_name, mdns_hostname, firmware_version, first_seen, last_seen, active)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(ip) DO UPDATE SET
+                INSERT INTO esp32_devices (mac_address, ip, device_name, mdns_hostname, firmware_version, first_seen, last_seen, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(mac_address) DO UPDATE SET
+                    ip = excluded.ip,
                     device_name = excluded.device_name,
                     mdns_hostname = excluded.mdns_hostname,
                     firmware_version = excluded.firmware_version,
                     last_seen = excluded.last_seen,
                     active = 1
-            ''', (ip, device['device_name'], device['mdns_hostname'], device['firmware_version'], now, now))
+            ''', (mac, device['ip'], device['device_name'], device['mdns_hostname'], device['firmware_version'], now, now))
 
         conn.commit()
         conn.close()
@@ -320,28 +325,29 @@ def poll_esp32_devices():
     global esp32_devices, last_esp32_poll
 
     with esp32_lock:
-        devices_to_poll = list(esp32_devices.keys())
+        # Get list of (mac, ip) tuples to poll
+        devices_to_poll = [(mac, device['ip']) for mac, device in esp32_devices.items()]
 
     if not devices_to_poll:
         return
 
     now = datetime.now().isoformat()
 
-    for ip in devices_to_poll:
+    for mac, ip in devices_to_poll:
         result = probe_esp32_device(ip)
         if result:
             with esp32_lock:
-                esp32_devices[ip] = result
+                esp32_devices[mac] = result
 
-            # Save to history
+            # Save to history using MAC address
             try:
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO esp32_history (device_ip, timestamp, temperature_c, humidity, pressure)
+                    INSERT INTO esp32_history (device_mac, timestamp, temperature_c, humidity, pressure)
                     VALUES (?, ?, ?, ?, ?)
-                ''', (ip, now, result['temperature_c'], result['humidity'], result['pressure']))
-                cursor.execute('UPDATE esp32_devices SET last_seen = ? WHERE ip = ?', (now, ip))
+                ''', (mac, now, result['temperature_c'], result['humidity'], result['pressure']))
+                cursor.execute('UPDATE esp32_devices SET last_seen = ?, ip = ? WHERE mac_address = ?', (now, ip, mac))
                 conn.commit()
                 conn.close()
             except Exception as e:
@@ -356,8 +362,8 @@ def get_esp32_devices():
         return list(esp32_devices.values())
 
 
-def get_esp32_history(device_ip=None, device_name=None, hours=24):
-    """Get ESP32 historical data. Filter by device_ip or device_name."""
+def get_esp32_history(device_mac=None, device_name=None, hours=24):
+    """Get ESP32 historical data. Filter by device_mac or device_name."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -365,27 +371,27 @@ def get_esp32_history(device_ip=None, device_name=None, hours=24):
 
         time_filter = f'-{hours} hours'
 
-        if device_ip:
+        if device_mac:
             cursor.execute('''
-                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                SELECT h.device_mac, d.device_name, d.ip as device_ip, h.timestamp, h.temperature_c, h.humidity, h.pressure
                 FROM esp32_history h
-                LEFT JOIN esp32_devices d ON h.device_ip = d.ip
-                WHERE h.device_ip = ? AND datetime(h.timestamp) >= datetime('now', 'localtime', ?)
+                LEFT JOIN esp32_devices d ON h.device_mac = d.mac_address
+                WHERE h.device_mac = ? AND datetime(h.timestamp) >= datetime('now', 'localtime', ?)
                 ORDER BY h.timestamp ASC
-            ''', (device_ip, time_filter))
+            ''', (device_mac, time_filter))
         elif device_name:
             cursor.execute('''
-                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                SELECT h.device_mac, d.device_name, d.ip as device_ip, h.timestamp, h.temperature_c, h.humidity, h.pressure
                 FROM esp32_history h
-                JOIN esp32_devices d ON h.device_ip = d.ip
+                JOIN esp32_devices d ON h.device_mac = d.mac_address
                 WHERE d.device_name = ? AND datetime(h.timestamp) >= datetime('now', 'localtime', ?)
                 ORDER BY h.timestamp ASC
             ''', (device_name, time_filter))
         else:
             cursor.execute('''
-                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                SELECT h.device_mac, d.device_name, d.ip as device_ip, h.timestamp, h.temperature_c, h.humidity, h.pressure
                 FROM esp32_history h
-                LEFT JOIN esp32_devices d ON h.device_ip = d.ip
+                LEFT JOIN esp32_devices d ON h.device_mac = d.mac_address
                 WHERE datetime(h.timestamp) >= datetime('now', 'localtime', ?)
                 ORDER BY h.timestamp ASC
             ''', (time_filter,))
@@ -739,17 +745,17 @@ async def api_esp32():
 
 
 @app.get("/api/esp32/history", response_class=JSONResponse)
-async def api_esp32_history(device_ip: str = None, device_name: str = None, hours: int = 24):
-    """Return ESP32 historical sensor data. Filter by device_ip or device_name."""
-    data = get_esp32_history(device_ip, device_name, hours)
+async def api_esp32_history(device_mac: str = None, device_name: str = None, hours: int = 24):
+    """Return ESP32 historical sensor data. Filter by device_mac or device_name."""
+    data = get_esp32_history(device_mac, device_name, hours)
     response = {
         "hours": hours,
         "points": len(data),
         "data": data
     }
     # Only include filter in response if one was applied
-    if device_ip:
-        response["filter"] = {"device_ip": device_ip}
+    if device_mac:
+        response["filter"] = {"device_mac": device_mac}
     elif device_name:
         response["filter"] = {"device_name": device_name}
     return response
@@ -1714,6 +1720,9 @@ async def dashboard():
                         <div class="esp32-device-header">
                             <span class="esp32-device-name">${device.device_name}</span>
                             <span class="esp32-device-ip">${device.ip}</span>
+                        </div>
+                        <div class="esp32-device-mac" style="font-size: 11px; font-family: monospace; color: var(--text-muted); margin-bottom: 8px;">
+                            MAC: ${device.mac_address || '--'}
                         </div>
                         <div class="esp32-readings">
                             <div>
