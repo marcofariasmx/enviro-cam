@@ -10,9 +10,13 @@ import socket
 import time
 import sqlite3
 import os
+import subprocess
+import urllib.request
+import json
 from threading import Condition, Thread, Lock
 from contextlib import asynccontextmanager
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # FastAPI
 from fastapi import FastAPI
@@ -52,6 +56,11 @@ HISTORY_INTERVAL = 300     # Seconds between history recordings (5 minutes)
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(DATA_DIR, "sensor_history.db")
 
+# ESP32 Discovery Settings
+ESP32_SCAN_INTERVAL = 300      # Seconds between network scans (5 minutes)
+ESP32_POLL_INTERVAL = 60       # Seconds between polling known devices
+ESP32_TIMEOUT = 1.0            # HTTP timeout for ESP32 requests
+
 
 # =============================================================================
 # Global State
@@ -77,6 +86,12 @@ sensor_lock = Lock()
 start_time = None
 last_history_save = 0
 
+# ESP32 state
+esp32_devices = {}  # {ip: device_data}
+esp32_lock = Lock()
+last_esp32_scan = 0
+last_esp32_poll = 0
+
 
 # =============================================================================
 # Database Setup
@@ -86,6 +101,8 @@ def init_database():
     """Initialize SQLite database for sensor history."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+
+    # Local BME680 sensor history
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sensor_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +116,37 @@ def init_database():
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_history(timestamp)')
+
+    # ESP32 devices registry
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS esp32_devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT UNIQUE NOT NULL,
+            device_name TEXT,
+            mdns_hostname TEXT,
+            firmware_version TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            active INTEGER DEFAULT 1
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_ip ON esp32_devices(ip)')
+
+    # ESP32 sensor history
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS esp32_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_ip TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            temperature_c REAL,
+            humidity REAL,
+            pressure REAL,
+            FOREIGN KEY (device_ip) REFERENCES esp32_devices(ip)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_history_ts ON esp32_history(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_esp32_history_device ON esp32_history(device_ip)')
+
     conn.commit()
     conn.close()
     print(f"Database: {DB_PATH} OK")
@@ -168,6 +216,196 @@ def get_history_stats():
     except Exception as e:
         print(f"Database stats error: {e}")
         return {"total_points": 0, "oldest": None, "newest": None}
+
+
+# =============================================================================
+# ESP32 Discovery & Polling
+# =============================================================================
+
+def get_local_network_prefix():
+    """Get the local network prefix (e.g., '192.168.50')."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        # Return first 3 octets
+        parts = ip.split('.')
+        return '.'.join(parts[:3])
+    except Exception:
+        return "192.168.1"
+
+
+def probe_esp32_device(ip):
+    """Probe a single IP for ESP32 device. Returns device data or None."""
+    try:
+        url = f"http://{ip}/status"
+        req = urllib.request.Request(url, headers={'User-Agent': 'EnviroCam/1.0'})
+        with urllib.request.urlopen(req, timeout=ESP32_TIMEOUT) as response:
+            data = json.loads(response.read().decode())
+            # Check if it's an ESP32 monitor device
+            if 'firmwareVersion' in data and 'sensorTemperature' in data:
+                return {
+                    'ip': ip,
+                    'device_name': data.get('deviceName', 'Unknown'),
+                    'mdns_hostname': data.get('mdnsHostname', ''),
+                    'firmware_version': data.get('firmwareVersion', ''),
+                    'temperature_c': data.get('sensorTemperature'),
+                    'humidity': data.get('ahtHumidity'),
+                    'pressure': data.get('bmpPressure'),
+                    'uptime': data.get('uptime', ''),
+                    'rssi': data.get('staRSSI'),
+                    'last_seen': datetime.now().isoformat()
+                }
+    except Exception:
+        pass
+    return None
+
+
+def scan_network_for_esp32():
+    """Scan local network for ESP32 devices."""
+    global esp32_devices, last_esp32_scan
+
+    prefix = get_local_network_prefix()
+    found_devices = {}
+
+    print(f"ESP32: Scanning {prefix}.1-254...")
+
+    # Use thread pool for parallel scanning
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(probe_esp32_device, f"{prefix}.{i}"): i for i in range(1, 255)}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                found_devices[result['ip']] = result
+                print(f"ESP32: Found '{result['device_name']}' at {result['ip']}")
+
+    # Update global state and database
+    with esp32_lock:
+        esp32_devices = found_devices
+        last_esp32_scan = time.time()
+
+    # Update database
+    now = datetime.now().isoformat()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Mark all devices as inactive first
+        cursor.execute('UPDATE esp32_devices SET active = 0')
+
+        for ip, device in found_devices.items():
+            cursor.execute('''
+                INSERT INTO esp32_devices (ip, device_name, mdns_hostname, firmware_version, first_seen, last_seen, active)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(ip) DO UPDATE SET
+                    device_name = excluded.device_name,
+                    mdns_hostname = excluded.mdns_hostname,
+                    firmware_version = excluded.firmware_version,
+                    last_seen = excluded.last_seen,
+                    active = 1
+            ''', (ip, device['device_name'], device['mdns_hostname'], device['firmware_version'], now, now))
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"ESP32 DB error: {e}")
+
+    print(f"ESP32: Found {len(found_devices)} device(s)")
+    return found_devices
+
+
+def poll_esp32_devices():
+    """Poll known ESP32 devices for current readings."""
+    global esp32_devices, last_esp32_poll
+
+    with esp32_lock:
+        devices_to_poll = list(esp32_devices.keys())
+
+    if not devices_to_poll:
+        return
+
+    now = datetime.now().isoformat()
+
+    for ip in devices_to_poll:
+        result = probe_esp32_device(ip)
+        if result:
+            with esp32_lock:
+                esp32_devices[ip] = result
+
+            # Save to history
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO esp32_history (device_ip, timestamp, temperature_c, humidity, pressure)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (ip, now, result['temperature_c'], result['humidity'], result['pressure']))
+                cursor.execute('UPDATE esp32_devices SET last_seen = ? WHERE ip = ?', (now, ip))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"ESP32 history save error: {e}")
+
+    last_esp32_poll = time.time()
+
+
+def get_esp32_devices():
+    """Get list of known ESP32 devices."""
+    with esp32_lock:
+        return list(esp32_devices.values())
+
+
+def get_esp32_history(device_ip=None, hours=24):
+    """Get ESP32 historical data."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        if device_ip:
+            cursor.execute('''
+                SELECT device_ip, timestamp, temperature_c, humidity, pressure
+                FROM esp32_history
+                WHERE device_ip = ? AND datetime(timestamp) >= datetime('now', 'localtime', ?)
+                ORDER BY timestamp ASC
+            ''', (device_ip, f'-{hours} hours'))
+        else:
+            cursor.execute('''
+                SELECT device_ip, timestamp, temperature_c, humidity, pressure
+                FROM esp32_history
+                WHERE datetime(timestamp) >= datetime('now', 'localtime', ?)
+                ORDER BY timestamp ASC
+            ''', (f'-{hours} hours',))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"ESP32 history read error: {e}")
+        return []
+
+
+def esp32_monitor_loop():
+    """Background thread for ESP32 discovery and polling."""
+    global last_esp32_scan, last_esp32_poll
+
+    # Initial scan after startup delay
+    time.sleep(10)
+    scan_network_for_esp32()
+
+    while True:
+        current_time = time.time()
+
+        # Periodic full network scan
+        if current_time - last_esp32_scan >= ESP32_SCAN_INTERVAL:
+            scan_network_for_esp32()
+
+        # Frequent polling of known devices
+        if current_time - last_esp32_poll >= ESP32_POLL_INTERVAL:
+            poll_esp32_devices()
+
+        time.sleep(10)  # Check every 10 seconds
 
 
 # =============================================================================
@@ -379,6 +617,11 @@ async def lifespan(app: FastAPI):
         sensor_thread = Thread(target=sensor_read_loop, daemon=True)
         sensor_thread.start()
 
+    # Start ESP32 discovery thread
+    esp32_thread = Thread(target=esp32_monitor_loop, daemon=True)
+    esp32_thread.start()
+    print("ESP32: Discovery service started")
+
     # Display URLs
     ip = get_ip_address()
     hostname = socket.gethostname()
@@ -393,6 +636,7 @@ async def lifespan(app: FastAPI):
     print(f"  GET /api/sensor    - Sensor data (JSON)")
     print(f"  GET /api/status    - System status (JSON)")
     print(f"  GET /api/history   - Historical data (JSON)")
+    print(f"  GET /api/esp32     - ESP32 devices (JSON)")
     print(f"  GET /stream.mjpg   - MJPEG video stream")
     print("-" * 50)
     print("\nPress Ctrl+C to stop.\n")
@@ -470,6 +714,36 @@ async def api_history(hours: int = 24):
         "points": len(data),
         "data": data
     }
+
+
+@app.get("/api/esp32", response_class=JSONResponse)
+async def api_esp32():
+    """Return list of discovered ESP32 devices."""
+    devices = get_esp32_devices()
+    return {
+        "count": len(devices),
+        "devices": devices
+    }
+
+
+@app.get("/api/esp32/history", response_class=JSONResponse)
+async def api_esp32_history(device_ip: str = None, hours: int = 24):
+    """Return ESP32 historical sensor data."""
+    data = get_esp32_history(device_ip, hours)
+    return {
+        "device_ip": device_ip,
+        "hours": hours,
+        "points": len(data),
+        "data": data
+    }
+
+
+@app.get("/api/esp32/scan", response_class=JSONResponse)
+async def api_esp32_scan():
+    """Trigger a network scan for ESP32 devices."""
+    # Run scan in background to not block
+    Thread(target=scan_network_for_esp32, daemon=True).start()
+    return {"status": "scan_started"}
 
 
 @app.get("/stream.mjpg")
@@ -947,6 +1221,96 @@ async def dashboard():
             color: var(--text-secondary);
         }
 
+        /* ESP32 Devices */
+        .esp32-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+        }
+
+        .esp32-device {
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            padding: 16px;
+            transition: transform 0.2s ease;
+        }
+
+        .esp32-device:hover {
+            transform: scale(1.02);
+        }
+
+        .esp32-device-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .esp32-device-name {
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--text-primary);
+        }
+
+        .esp32-device-ip {
+            font-size: 12px;
+            font-family: "SF Mono", "Fira Code", monospace;
+            color: var(--text-muted);
+        }
+
+        .esp32-readings {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            text-align: center;
+        }
+
+        .esp32-reading-value {
+            font-size: 20px;
+            font-weight: 700;
+            font-family: "SF Mono", "Fira Code", monospace;
+            color: var(--accent);
+        }
+
+        .esp32-reading-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .esp32-status {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .esp32-empty {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+
+        .esp32-scan-btn {
+            margin-left: auto;
+            padding: 6px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .esp32-scan-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
         /* Responsive */
         @media (max-width: 768px) {
             .container { padding: 16px; }
@@ -1065,6 +1429,16 @@ async def dashboard():
                     </div>
                 </div>
             </div>
+
+            <div class="card chart-card">
+                <div class="card-header">
+                    <h2><span class="card-icon">&#128225;</span> ESP32 Sensors</h2>
+                    <button class="esp32-scan-btn" onclick="scanEsp32()">Scan Network</button>
+                </div>
+                <div id="esp32-container" class="esp32-grid">
+                    <div class="esp32-empty">Scanning for ESP32 devices...</div>
+                </div>
+            </div>
         </div>
 
         <footer>
@@ -1072,6 +1446,7 @@ async def dashboard():
                 <a href="/api/sensor" class="api-link">/api/sensor</a>
                 <a href="/api/status" class="api-link">/api/status</a>
                 <a href="/api/history" class="api-link">/api/history</a>
+                <a href="/api/esp32" class="api-link">/api/esp32</a>
                 <a href="/stream.mjpg" class="api-link">/stream.mjpg</a>
             </div>
         </footer>
@@ -1305,10 +1680,67 @@ async def dashboard():
             }
         };
 
+        // ESP32 functions
+        async function loadEsp32Devices() {
+            try {
+                const res = await fetch('/api/esp32');
+                const result = await res.json();
+                const container = document.getElementById('esp32-container');
+
+                if (result.count === 0) {
+                    container.innerHTML = '<div class="esp32-empty">No ESP32 devices found. Click "Scan Network" to search.</div>';
+                    return;
+                }
+
+                container.innerHTML = result.devices.map(device => `
+                    <div class="esp32-device">
+                        <div class="esp32-device-header">
+                            <span class="esp32-device-name">${device.device_name}</span>
+                            <span class="esp32-device-ip">${device.ip}</span>
+                        </div>
+                        <div class="esp32-readings">
+                            <div>
+                                <div class="esp32-reading-value">${device.temperature_c !== null ? device.temperature_c.toFixed(1) : '--'}</div>
+                                <div class="esp32-reading-label">Temp C</div>
+                            </div>
+                            <div>
+                                <div class="esp32-reading-value">${device.humidity !== null ? device.humidity.toFixed(1) : '--'}</div>
+                                <div class="esp32-reading-label">Humidity</div>
+                            </div>
+                            <div>
+                                <div class="esp32-reading-value">${device.pressure !== null ? device.pressure.toFixed(0) : '--'}</div>
+                                <div class="esp32-reading-label">hPa</div>
+                            </div>
+                        </div>
+                        <div class="esp32-status">
+                            <span>Uptime: ${device.uptime || '--'}</span>
+                            <span>RSSI: ${device.rssi || '--'} dBm</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('ESP32 load failed:', e);
+            }
+        }
+
+        async function scanEsp32() {
+            const container = document.getElementById('esp32-container');
+            container.innerHTML = '<div class="esp32-empty">Scanning network for ESP32 devices...</div>';
+            try {
+                await fetch('/api/esp32/scan');
+                // Wait a bit then reload
+                setTimeout(loadEsp32Devices, 5000);
+            } catch (e) {
+                console.error('ESP32 scan failed:', e);
+            }
+        }
+
         updateStatus();
         updateSensor();
         loadHistory(24);
+        loadEsp32Devices();
         setInterval(updateSensor, 3000);
+        setInterval(loadEsp32Devices, 30000); // Refresh ESP32 every 30 sec
         setInterval(() => loadHistory(currentHours), 300000); // Refresh chart every 5 min
     </script>
 </body>

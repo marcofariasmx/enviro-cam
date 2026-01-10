@@ -1,6 +1,6 @@
 # Enviro-Cam
 
-A FastAPI web application serving BME680 sensor data and live camera stream on Raspberry Pi.
+A FastAPI web application serving BME680 sensor data and live camera stream on Raspberry Pi. Includes historical data storage and ESP32 device discovery.
 
 ## Hardware Requirements
 
@@ -100,6 +100,8 @@ API Endpoints:
   GET /              - Web dashboard
   GET /api/sensor    - Sensor data (JSON)
   GET /api/status    - System status (JSON)
+  GET /api/history   - Historical data (JSON)
+  GET /api/esp32     - ESP32 devices (JSON)
   GET /stream.mjpg   - MJPEG video stream
 --------------------------------------------------
 
