@@ -356,27 +356,39 @@ def get_esp32_devices():
         return list(esp32_devices.values())
 
 
-def get_esp32_history(device_ip=None, hours=24):
-    """Get ESP32 historical data."""
+def get_esp32_history(device_ip=None, device_name=None, hours=24):
+    """Get ESP32 historical data. Filter by device_ip or device_name."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        time_filter = f'-{hours} hours'
+
         if device_ip:
             cursor.execute('''
-                SELECT device_ip, timestamp, temperature_c, humidity, pressure
-                FROM esp32_history
-                WHERE device_ip = ? AND datetime(timestamp) >= datetime('now', 'localtime', ?)
-                ORDER BY timestamp ASC
-            ''', (device_ip, f'-{hours} hours'))
+                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                FROM esp32_history h
+                LEFT JOIN esp32_devices d ON h.device_ip = d.ip
+                WHERE h.device_ip = ? AND datetime(h.timestamp) >= datetime('now', 'localtime', ?)
+                ORDER BY h.timestamp ASC
+            ''', (device_ip, time_filter))
+        elif device_name:
+            cursor.execute('''
+                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                FROM esp32_history h
+                JOIN esp32_devices d ON h.device_ip = d.ip
+                WHERE d.device_name = ? AND datetime(h.timestamp) >= datetime('now', 'localtime', ?)
+                ORDER BY h.timestamp ASC
+            ''', (device_name, time_filter))
         else:
             cursor.execute('''
-                SELECT device_ip, timestamp, temperature_c, humidity, pressure
-                FROM esp32_history
-                WHERE datetime(timestamp) >= datetime('now', 'localtime', ?)
-                ORDER BY timestamp ASC
-            ''', (f'-{hours} hours',))
+                SELECT h.device_ip, d.device_name, h.timestamp, h.temperature_c, h.humidity, h.pressure
+                FROM esp32_history h
+                LEFT JOIN esp32_devices d ON h.device_ip = d.ip
+                WHERE datetime(h.timestamp) >= datetime('now', 'localtime', ?)
+                ORDER BY h.timestamp ASC
+            ''', (time_filter,))
 
         rows = cursor.fetchall()
         conn.close()
@@ -727,15 +739,20 @@ async def api_esp32():
 
 
 @app.get("/api/esp32/history", response_class=JSONResponse)
-async def api_esp32_history(device_ip: str = None, hours: int = 24):
-    """Return ESP32 historical sensor data."""
-    data = get_esp32_history(device_ip, hours)
-    return {
-        "device_ip": device_ip,
+async def api_esp32_history(device_ip: str = None, device_name: str = None, hours: int = 24):
+    """Return ESP32 historical sensor data. Filter by device_ip or device_name."""
+    data = get_esp32_history(device_ip, device_name, hours)
+    response = {
         "hours": hours,
         "points": len(data),
         "data": data
     }
+    # Only include filter in response if one was applied
+    if device_ip:
+        response["filter"] = {"device_ip": device_ip}
+    elif device_name:
+        response["filter"] = {"device_name": device_name}
+    return response
 
 
 @app.get("/api/esp32/scan", response_class=JSONResponse)
