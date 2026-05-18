@@ -1,0 +1,10 @@
+[Unit]
+Description=Run network watchdog every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=net-watchdog.service
+
+[Install]
+WantedBy=timers.target

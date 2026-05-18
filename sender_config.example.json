@@ -1,0 +1,5 @@
+{
+    "receiver_url": "https://your-receiver.example.com",
+    "api_key": "REPLACE_ME",
+    "device_id": "your-device-id"
+}

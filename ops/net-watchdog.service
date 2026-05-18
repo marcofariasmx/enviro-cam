@@ -1,0 +1,7 @@
+[Unit]
+Description=Network watchdog (ping gateway, recover if stuck)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/net-watchdog.sh

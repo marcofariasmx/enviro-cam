@@ -1,0 +1,15 @@
+[Unit]
+Description=Sensor Data Sender for rancho-cam-pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mafx
+WorkingDirectory=/home/mafx/enviro-cam
+ExecStart=/home/mafx/enviro-cam/venv/bin/python /home/mafx/enviro-cam/sender.py --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
