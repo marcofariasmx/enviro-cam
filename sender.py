@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import socket
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -30,6 +31,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 import requests
+
+import stream_gateway
 
 # Configure logging
 logging.basicConfig(
@@ -126,7 +129,20 @@ def init_sensor():
 
 
 def init_camera():
-    """Initialize Pi camera (reused across captures)."""
+    """Initialize Pi camera (reused across captures).
+
+    Uses a dual-stream video configuration (not create_still_configuration)
+    so the on-demand stream_gateway can run a concurrent low-bitrate H264
+    encoder on the "lores" stream while this still-capture path keeps using
+    "main" exactly as before -- picamera2/libcamera only allow one process
+    to hold the camera, so both jobs have to share a single open instance.
+
+    FrameDurationLimits is widened to 15.1s (matching the low-light manual
+    exposure below) because a video configuration otherwise caps exposure
+    to a fast video frame rate by default, which would silently break the
+    15s night-mode capture. Confirmed on real hardware: the still capture
+    at "main" is unaffected in normal (fast/auto) daylight conditions.
+    """
     global _picam2
     if _picam2 is not None:
         return _picam2
@@ -135,12 +151,18 @@ def init_camera():
         from picamera2 import Picamera2
 
         _picam2 = Picamera2()
-        # Use 1280x720 for smaller file size (~100-200KB vs 500KB+)
-        config = _picam2.create_still_configuration(main={"size": (1280, 720)})
+        # 1280x720 main for stills (unchanged file size, ~100-200KB); a
+        # smaller 640x480 lores stream feeds the optional live stream.
+        config = _picam2.create_video_configuration(
+            main={"size": (1280, 720)},
+            lores={"size": (640, 480)},
+            encode="lores",
+            controls={"FrameDurationLimits": (100, 15_100_000)},
+        )
         _picam2.configure(config)
         _picam2.start()
         time.sleep(2)  # Allow camera to warm up
-        logger.info("Camera initialized")
+        logger.info("Camera initialized (dual-stream: main 1280x720 + lores 640x480)")
         return _picam2
 
     except ImportError:
@@ -382,7 +404,16 @@ def capture_image_to_memory():
                 "ExposureTime": target_exposure,
                 "AnalogueGain": target_gain
             })
-            time.sleep(0.5)  # Let settings apply
+            # In the continuous video-mode pipeline (needed for the
+            # concurrent stream feed), a frame shot under the OLD fast/auto
+            # settings can still be queued when we ask for one -- capture
+            # would just hand that stale frame back instantly instead of
+            # a genuine 15s exposure. Wait past the requested exposure time
+            # so the frame we grab is guaranteed to be a fresh one shot
+            # under the new manual settings. Confirmed on hardware: without
+            # this wait, AnalogueGain silently reports ~1.1 (auto's last
+            # value) instead of the requested 8.0.
+            time.sleep(target_exposure / 1_000_000 + 1)
             logger.info(f"Low light detected (gain={auto_gain:.1f}) -> using 15s manual exposure")
 
         # Capture the image
@@ -689,7 +720,21 @@ def run_daemon(config: dict, interval_minutes: int = 5):
     logger.info(f"Queue limits: {MAX_SENSOR_QUEUE} sensors, {MAX_IMAGE_QUEUE} images")
 
     # Initialize camera once at startup
-    init_camera()
+    picam2 = init_camera()
+
+    # Start the on-demand stream control server as a background thread of
+    # this same process -- it shares the single open Picamera2 instance
+    # above rather than opening its own (only one process/owner allowed).
+    stream_api_key = config.get("stream_api_key")
+    if picam2 is not None and stream_api_key:
+        t = threading.Thread(
+            target=stream_gateway.run_server,
+            args=(picam2, stream_api_key),
+            daemon=True,
+        )
+        t.start()
+    elif picam2 is not None:
+        logger.warning("stream_api_key not set in sender_config.json -- live streaming disabled")
 
     while True:
         try:
