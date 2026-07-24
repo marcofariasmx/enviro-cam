@@ -173,53 +173,39 @@ def init_camera():
         return None
 
 
-def calculate_air_quality(gas_resistance, humidity):
+def calculate_air_quality(gas_resistance):
     """
-    Calculate air quality score (0-100) based on gas resistance and humidity.
+    Calculate air quality score (0-100) from raw gas resistance alone.
     Higher score = better air quality.
 
-    Based on widely-used community algorithm from G6EJD/BME680-Example:
-    - Humidity contributes up to 25% (optimal at 38-42%)
-    - Gas resistance contributes up to 75%
+    Previously (community algorithm from G6EJD/BME680-Example) this also
+    scored humidity, treating 38-42% RH as "optimal" and penalizing any
+    deviation -- a reasonable proxy for INDOOR comfort, but wrong applied
+    to this OUTDOOR sensor: a rainy or dewy morning would drag the score
+    down as if it were pollution, when it's just weather. Dropped
+    2026-07-24; see homelab-map/devices/rancho-cam-pi.md for the full
+    rationale and the planned proper fix (humidity-compensated gas
+    resistance via absolute humidity, once enough raw gas_resistance
+    history has accumulated to calibrate it for this specific sensor --
+    raw values are now persisted in sensor_readings.gas_resistance for
+    exactly that purpose).
 
     Gas resistance typical ranges:
     - Clean air: 50,000 - 500,000+ ohms
     - Polluted air: 10,000 - 50,000 ohms
     """
-    # Humidity reference (optimal range 38-42%)
-    hum_reference = 40.0
-
-    # Gas resistance bounds (ohms)
-    # These are typical values; sensor-specific calibration improves accuracy
     gas_lower_limit = 10000   # Poor air quality
     gas_upper_limit = 300000  # Excellent air quality
 
-    # Calculate humidity score (0-25)
-    if 38 <= humidity <= 42:
-        # Optimal humidity range
-        humidity_score = 25.0
-    elif humidity < 38:
-        # Too dry - linear decrease
-        humidity_score = (humidity / hum_reference) * 25.0
-    else:
-        # Too humid - linear decrease
-        humidity_score = ((100.0 - humidity) / (100.0 - hum_reference)) * 25.0
-
-    humidity_score = max(0, min(25, humidity_score))
-
-    # Calculate gas score (0-75)
     if gas_resistance >= gas_upper_limit:
-        gas_score = 75.0
+        score = 100.0
     elif gas_resistance <= gas_lower_limit:
-        gas_score = 0.0
+        score = 0.0
     else:
-        # Linear scale between limits
-        gas_score = ((gas_resistance - gas_lower_limit) /
-                    (gas_upper_limit - gas_lower_limit)) * 75.0
+        score = ((gas_resistance - gas_lower_limit) /
+                 (gas_upper_limit - gas_lower_limit)) * 100.0
 
-    gas_score = max(0, min(75, gas_score))
-
-    return round(humidity_score + gas_score, 1)
+    return round(max(0.0, min(100.0, score)), 1)
 
 
 def get_local_sensor_data():
@@ -253,16 +239,16 @@ def get_local_sensor_data():
             "temperature_c": round(sensor.data.temperature, 2),
             "humidity": round(sensor.data.humidity, 2),
             "pressure": round(sensor.data.pressure, 2),
-            "air_quality": None
+            "air_quality": None,
+            "gas_resistance": None,
         }
 
         if heat_stable and sensor.data.gas_resistance:
-            data["air_quality"] = calculate_air_quality(
-                sensor.data.gas_resistance,
-                sensor.data.humidity
-            )
+            data["gas_resistance"] = round(sensor.data.gas_resistance, 1)
+            data["air_quality"] = calculate_air_quality(sensor.data.gas_resistance)
             logger.info(f"Sensor: {data['temperature_c']}C, {data['humidity']}% RH, "
-                       f"{data['pressure']} hPa, AQ: {data['air_quality']}%")
+                       f"{data['pressure']} hPa, AQ: {data['air_quality']}%, "
+                       f"gas: {data['gas_resistance']:.0f}ohm")
         else:
             logger.info(f"Sensor: {data['temperature_c']}C, {data['humidity']}% RH, "
                        f"{data['pressure']} hPa (gas not stable yet)")
