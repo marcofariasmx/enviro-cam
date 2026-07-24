@@ -24,6 +24,7 @@ locally via stream_storage.py and exported as Prometheus textfile counters
 -- same durability rationale as growatt_storage.py: don't let this data
 depend on main-pi5's Prometheus successfully scraping at the right moment.
 """
+import io
 import json
 import logging
 import os
@@ -55,16 +56,25 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 _CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered H264 at these bitrates
 
 
-class _Broadcaster:
+class _Broadcaster(io.BufferedIOBase):
     """Fans out encoder output to every currently-connected HTTP client.
     A slow/stalled client gets its oldest buffered bytes dropped rather
     than blocking (or slowing down) the encoder thread for everyone else.
+
+    Subclasses io.BufferedIOBase because picamera2's FileOutput requires
+    it (raises "Must pass io.BufferedIOBase" otherwise) -- confirmed live
+    the hard way when a plain object here silently killed every stream
+    start attempt.
     """
 
     def __init__(self):
+        super().__init__()
         self._lock = threading.Lock()
         self._clients = []
         self.bytes_written = 0
+
+    def writable(self):
+        return True
 
     def register(self):
         q = queue.Queue(maxsize=_CLIENT_QUEUE_MAXSIZE)
