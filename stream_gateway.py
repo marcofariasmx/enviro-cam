@@ -73,7 +73,11 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 # network budget straight through is what produced ~5 KB frames that
 # looked like a Mario Bros video game. Divide it out instead, so the
 # bytes that actually hit the wire match what was budgeted.
-MJPEG_BITRATE_EFFICIENCY = 0.19
+# The exact ratio drifts with scene detail (measured 0.18-0.22 across
+# runs), so this errs on the high side deliberately: overshooting the
+# factor lands slightly UNDER budget, which is the safe direction for a
+# link the rest of the ranch is sharing.
+MJPEG_BITRATE_EFFICIENCY = 0.22
 MAX_ENCODER_BITRATE_KBPS = 20000
 
 # The camera's video configuration allows a 100us minimum frame duration,
