@@ -354,19 +354,69 @@ def get_esp32_data():
         return []
 
 
+def _mean_brightness(image_bytes):
+    """Mean luma (0-255) of a JPEG, measured on a thumbnail so it costs
+    almost nothing. Used to verify a manual exposure actually landed."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    img.thumbnail((160, 120))
+    pixels = list(img.getdata())
+    return sum(pixels) / len(pixels)
+
+
+# Manual (low-light) exposure control. See capture_image_to_memory().
+LOW_LIGHT_GAIN_THRESHOLD = 4.0   # above this, auto-exposure is struggling
+# At/above this, auto-exposure has run out of road entirely (sensor max
+# gain is 16) -- its metered result is clipped and underexposed, so
+# preserving its brightness would just reproduce a too-dark frame. Genuine
+# darkness: start long and let the feedback loop pull back if needed.
+AE_CLIPPED_GAIN = 15.0
+NIGHT_GAIN_CAP = 8.0             # balances brightness vs noise (sensor max is 16)
+MIN_EXPOSURE_US = 1_000
+MAX_EXPOSURE_US = 15_000_000     # 15s; matches FrameDurationLimits' maximum
+# Acceptable mean-luma band for a manual exposure, and what we aim for when
+# correcting. Deliberately wide -- this is a "not blown out, not black"
+# check, not an attempt to art-direct every frame.
+BRIGHTNESS_TARGET = 130
+BRIGHTNESS_MIN = 85
+BRIGHTNESS_MAX = 175
+BRIGHTNESS_CLIPPED = 250  # at/above this the frame is blown; see the loop
+MAX_EXPOSURE_ATTEMPTS = 4
+
+
 def capture_image_to_memory():
     """
     Capture image with adaptive exposure for low light.
-    When auto-exposure uses high gain (>4), switch to manual long exposure.
-    Based on Pi Forums research: 15s exposure with gain 8 works well for night.
 
-    Note: AeExposureMode.Long is broken (GitHub #1324) - auto-exposure prefers
-    high gain over long exposure. Manual mode is the only reliable approach.
+    When auto-exposure resorts to high gain, we take over with a manual
+    long exposure -- AeExposureMode.Long is broken (GitHub #1324), auto
+    always prefers gain over exposure, so manual is the only reliable way
+    to get a usable night landscape.
+
+    The exposure is DERIVED from what auto-exposure actually metered, not
+    fixed. A previous version forced a flat 15s at gain 8 for anything over
+    the gain threshold, which is correct in full darkness but catastrophic
+    at dusk and dawn: gain crosses the threshold while there's still plenty
+    of light, and 15s then overexposes the frame to solid white -- the
+    burned-out images that showed up in the timelapse at every day/night
+    transition. Two things prevent that now:
+
+    1. Gain is never raised above what auto-exposure chose
+       (`min(NIGHT_GAIN_CAP, auto_gain)`), and exposure is scaled to
+       preserve the brightness auto already metered
+       (brightness is proportional to exposure x gain). At dusk this
+       reproduces auto's own result instead of overriding it.
+    2. The result is measured and corrected. In genuine darkness auto is
+       clipped -- it maxes out gain and still underexposes -- so the
+       brightness-preserving estimate comes out too dark; the loop then
+       extends exposure toward the 15s ceiling. In borderline light it
+       equally protects against overshooting.
     """
     picam2 = init_camera()
     if picam2 is None:
         return None
 
+    is_low_light = False
     try:
         # Let auto-exposure analyze the scene first
         time.sleep(0.5)
@@ -374,60 +424,118 @@ def capture_image_to_memory():
         auto_exposure = metadata.get("ExposureTime", 0)  # microseconds
         auto_gain = metadata.get("AnalogueGain", 1.0)
 
-        # If gain > 4, auto-exposure is struggling with low light
-        # Switch to manual mode with research-backed settings
-        is_low_light = auto_gain > 4.0
+        is_low_light = auto_gain > LOW_LIGHT_GAIN_THRESHOLD
 
-        if is_low_light:
-            # Research-recommended night settings:
-            # - 15 seconds exposure (research suggests 10-15s for night landscapes)
-            # - Gain 8 (balances brightness vs noise, max is 16)
-            target_exposure = 15000000  # 15 seconds in microseconds
-            target_gain = 8.0
+        if not is_low_light:
+            # Daylight: auto-exposure is doing fine, don't touch it.
+            buffer = io.BytesIO()
+            picam2.capture_file(buffer, format='jpeg')
+            image_bytes = buffer.getvalue()
+            final_metadata = picam2.capture_metadata()
+            logger.info(
+                f"Image captured ({len(image_bytes) / 1024:.1f} KB, "
+                f"{final_metadata.get('ExposureTime', 0) / 1_000_000:.2f}s, "
+                f"gain={final_metadata.get('AnalogueGain', 1.0):.1f})"
+            )
+            return image_bytes
 
+        # Never gain up beyond what auto already chose -- raising gain would
+        # only add noise, and at dusk auto's gain is the more conservative
+        # of the two.
+        target_gain = min(NIGHT_GAIN_CAP, auto_gain)
+        if auto_gain >= AE_CLIPPED_GAIN:
+            # Auto-exposure is pinned at max gain and still underexposing --
+            # its reading is a floor, not a correct meter. This is real
+            # darkness, so open all the way up (what the old fixed-15s
+            # behaviour got right) and let the loop below walk it back if
+            # that turns out to be too much.
+            exposure = MAX_EXPOSURE_US
+        else:
+            # brightness ~ exposure x gain, so hold the product constant.
+            exposure = auto_exposure * auto_gain / target_gain
+        exposure = int(max(MIN_EXPOSURE_US, min(MAX_EXPOSURE_US, exposure)))
+
+        image_bytes = None
+        for attempt in range(MAX_EXPOSURE_ATTEMPTS):
             picam2.set_controls({
                 "AeEnable": False,
-                "ExposureTime": target_exposure,
-                "AnalogueGain": target_gain
+                "ExposureTime": exposure,
+                "AnalogueGain": target_gain,
             })
             # In the continuous video-mode pipeline (needed for the
-            # concurrent stream feed), a frame shot under the OLD fast/auto
-            # settings can still be queued when we ask for one -- capture
-            # would just hand that stale frame back instantly instead of
-            # a genuine 15s exposure. Wait past the requested exposure time
-            # so the frame we grab is guaranteed to be a fresh one shot
-            # under the new manual settings. Confirmed on hardware: without
-            # this wait, AnalogueGain silently reports ~1.1 (auto's last
-            # value) instead of the requested 8.0.
-            time.sleep(target_exposure / 1_000_000 + 1)
-            logger.info(f"Low light detected (gain={auto_gain:.1f}) -> using 15s manual exposure")
+            # concurrent stream feed), a frame shot under the OLD settings
+            # can still be queued when we ask for one -- capture would just
+            # hand that stale frame back instantly instead of one taken
+            # with what we just set. Wait past the requested exposure time
+            # so the frame we grab is guaranteed to be fresh. Confirmed on
+            # hardware: without this wait, AnalogueGain silently reports
+            # auto's last value instead of the requested one.
+            time.sleep(exposure / 1_000_000 + 1)
 
-        # Capture the image
-        buffer = io.BytesIO()
-        picam2.capture_file(buffer, format='jpeg')
-        image_bytes = buffer.getvalue()
+            buffer = io.BytesIO()
+            picam2.capture_file(buffer, format='jpeg')
+            image_bytes = buffer.getvalue()
 
-        # Get actual capture metadata
-        final_metadata = picam2.capture_metadata()
-        exposure_s = final_metadata.get("ExposureTime", 0) / 1000000
-        gain = final_metadata.get("AnalogueGain", 1.0)
+            brightness = _mean_brightness(image_bytes)
+            logger.info(
+                f"Low light (auto gain={auto_gain:.1f}): attempt {attempt + 1} "
+                f"@ {exposure / 1_000_000:.2f}s gain={target_gain:.1f} "
+                f"-> brightness {brightness:.0f}"
+            )
+            if BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX:
+                break
 
-        # Restore auto-exposure for next cycle
-        if is_low_light:
+            if brightness >= BRIGHTNESS_CLIPPED:
+                # A blown-out frame reads 255 no matter how far over it is,
+                # so the proportional correction below would understate the
+                # cut (255 -> only a halving) and burn every remaining
+                # attempt creeping down. Step down hard instead.
+                factor = 0.2
+            else:
+                # Scale toward the target, bounded so a wildly off reading
+                # can't send exposure to an extreme in one jump.
+                factor = BRIGHTNESS_TARGET / max(brightness, 1.0)
+                factor = max(0.15, min(6.0, factor))
+            corrected = int(max(MIN_EXPOSURE_US, min(MAX_EXPOSURE_US, exposure * factor)))
+            if corrected == exposure:
+                break  # already at a rail, further attempts change nothing
+            exposure = corrected
+
+        if brightness >= BRIGHTNESS_CLIPPED:
+            # Every manual attempt still came back blown out. Rather than
+            # store the solid-white frame this whole change exists to
+            # prevent, hand the scene back to auto-exposure: a noisy but
+            # legible frame beats a burned one in the timelapse.
+            logger.warning(
+                f"Manual exposure still clipped after {MAX_EXPOSURE_ATTEMPTS} "
+                f"attempts (brightness {brightness:.0f}) -- falling back to auto"
+            )
             picam2.set_controls({"AeEnable": True})
+            time.sleep(1.5)
+            buffer = io.BytesIO()
+            picam2.capture_file(buffer, format='jpeg')
+            image_bytes = buffer.getvalue()
 
-        size_kb = len(image_bytes) / 1024
-        logger.info(f"Image captured ({size_kb:.1f} KB, {exposure_s:.2f}s, gain={gain:.1f})")
-
+        final_metadata = picam2.capture_metadata()
+        logger.info(
+            f"Image captured ({len(image_bytes) / 1024:.1f} KB, "
+            f"{final_metadata.get('ExposureTime', 0) / 1_000_000:.2f}s, "
+            f"gain={final_metadata.get('AnalogueGain', 1.0):.1f})"
+        )
         return image_bytes
 
     except Exception as e:
         logger.error(f"Error capturing image: {e}")
-        try:
-            picam2.set_controls({"AeEnable": True})
-        except Exception:
-            pass
         return None
+    finally:
+        # Hand the camera back to auto-exposure no matter how we left --
+        # a manual exposure left set would otherwise persist into the live
+        # stream and every subsequent capture.
+        if is_low_light:
+            try:
+                picam2.set_controls({"AeEnable": True})
+            except Exception:
+                pass
 
 
 # =============================================================================
