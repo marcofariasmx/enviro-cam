@@ -58,7 +58,7 @@ PROM_PATH = "/var/lib/prometheus/node-exporter/stream.prom"
 # request, independent of whatever bandwidth-gating logic main-pi5 applies
 # on its side.
 MIN_BITRATE_KBPS = 150
-MAX_BITRATE_KBPS = 2000
+MAX_BITRATE_KBPS = 20000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
 # The camera's video configuration allows a 100us minimum frame duration,
