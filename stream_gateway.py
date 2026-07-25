@@ -9,15 +9,23 @@ lesson, same one already learned with the Growatt inverter's Modbus port),
 so this is wired in as a background thread of sender.py's daemon rather
 than a separate service. See stream_feasibility findings: the still
 capture continues completely unaffected on the "main" stream while this
-module drives an H264 encoder on the concurrent "lores" stream.
+module drives an encoder on the concurrent "lores" stream.
 
-Transport is raw H264 over a long-lived HTTP GET, broadcast to however
-many clients are connected (in practice just main-pi5, which re-muxes it
-to fragmented MP4 and fans it out to browser viewers -- see the
-monitor-cam-webapp side). Bitrate and the hard session-duration cap are
-both supplied by the caller (main-pi5 decides bitrate from real uplink
-headroom); this module just enforces sane bounds and never trusts the
-caller's numbers blindly.
+Transport is MJPEG (multipart/x-mixed-replace), broadcast to however many
+clients are connected (in practice just main-pi5, which fans it out
+byte-for-byte to browser viewers -- see the monitor-cam-webapp side).
+This replaced an earlier H264-over-ffmpeg-remux-into-fragmented-MP4 design
+that main-pi5 fed through MediaSource/appendBuffer client-side: that
+combination is a well-documented source of silent, hard-to-diagnose
+failures (CHUNK_DEMUXER_ERROR_APPEND_FAILED and related stalls with no
+error ever surfacing) and, on reconnect, never even got the request off
+the browser reliably. MJPEG via a plain <img> tag needs no client-side
+media pipeline at all -- multipart/x-mixed-replace has been handled
+natively by every browser for decades, and each frame is retrieved from
+each viewer, avoiding this whole bug class rather than patching around it.
+Bitrate and the hard session-duration cap are both supplied by the caller
+(main-pi5 decides bitrate from real uplink headroom); this module just
+enforces sane bounds and never trusts the caller's numbers blindly.
 
 Session history (bytes actually pushed, duration, how it ended) is logged
 locally via stream_storage.py and exported as Prometheus textfile counters
@@ -34,7 +42,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from picamera2.encoders import H264Encoder
+from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 
 import stream_storage
@@ -53,7 +61,13 @@ MIN_BITRATE_KBPS = 150
 MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
-_CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered H264 at these bitrates
+_CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered MJPEG at these bitrates
+
+# multipart/x-mixed-replace boundary token, shared between the framing
+# written here and the Content-Type header both this module's own HTTP
+# handler and main-pi5's relay give to browsers -- must match exactly.
+MULTIPART_BOUNDARY = b"FRAME"
+MULTIPART_CONTENT_TYPE = f"multipart/x-mixed-replace; boundary={MULTIPART_BOUNDARY.decode()}"
 
 
 class _Broadcaster(io.BufferedIOBase):
@@ -65,6 +79,18 @@ class _Broadcaster(io.BufferedIOBase):
     it (raises "Must pass io.BufferedIOBase" otherwise) -- confirmed live
     the hard way when a plain object here silently killed every stream
     start attempt.
+
+    Each write() call from the encoder is exactly one complete JPEG frame
+    (picamera2's encoder/FileOutput contract) -- wrapping it in its own
+    multipart part here, once, means every consumer (main-pi5's single
+    upstream connection today, or a hypothetical direct viewer later)
+    receives an already-correctly-framed byte stream it can just forward
+    verbatim. A viewer joining mid-stream simply lands inside this
+    boundary-delimited sequence and renders from the next full frame --
+    multipart parsers (browsers included) treat anything before the first
+    boundary match as discardable preamble, so no separate "cache the
+    first chunk for late joiners" logic (needed for fMP4's init segment)
+    is required here.
     """
 
     def __init__(self):
@@ -88,20 +114,26 @@ class _Broadcaster(io.BufferedIOBase):
                 self._clients.remove(q)
 
     def write(self, buf):
-        data = bytes(buf)
+        frame = bytes(buf)
+        packet = (
+            b"--" + MULTIPART_BOUNDARY + b"\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+            frame + b"\r\n"
+        )
         with self._lock:
             clients = list(self._clients)
-            self.bytes_written += len(data)
+            self.bytes_written += len(packet)
         for q in clients:
             try:
-                q.put_nowait(data)
+                q.put_nowait(packet)
             except queue.Full:
                 try:
                     q.get_nowait()
-                    q.put_nowait(data)
+                    q.put_nowait(packet)
                 except queue.Empty:
                     pass
-        return len(data)
+        return len(frame)
 
     def flush(self):
         pass
@@ -186,7 +218,7 @@ def start_stream(bitrate_kbps, max_seconds):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
-        encoder = H264Encoder(bitrate=bitrate_kbps * 1000)
+        encoder = MJPEGEncoder(bitrate=bitrate_kbps * 1000)
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name="lores")
 
         _state.active = True
@@ -241,7 +273,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._json(200, {"status": "ok", **status()})
 
-        if self.path == "/stream/raw.h264":
+        if self.path == "/stream/mjpeg":
             if not self._authed():
                 return self._json(401, {"error": "bad api key"})
             with _state.lock:
@@ -250,7 +282,7 @@ class _Handler(BaseHTTPRequestHandler):
                 broadcaster = _state.broadcaster
                 q = broadcaster.register()
             self.send_response(200)
-            self.send_header("Content-Type", "video/h264")
+            self.send_header("Content-Type", MULTIPART_CONTENT_TYPE)
             self.end_headers()
             try:
                 while True:

@@ -132,7 +132,7 @@ def init_camera():
     """Initialize Pi camera (reused across captures).
 
     Uses a dual-stream video configuration (not create_still_configuration)
-    so the on-demand stream_gateway can run a concurrent low-bitrate H264
+    so the on-demand stream_gateway can run a concurrent low-bitrate MJPEG
     encoder on the "lores" stream while this still-capture path keeps using
     "main" exactly as before -- picamera2/libcamera only allow one process
     to hold the camera, so both jobs have to share a single open instance.
