@@ -62,23 +62,59 @@ MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
 # `bitrate_kbps` from the caller is a NETWORK budget (main-pi5 derives it
-# from real measured uplink headroom). It is NOT what this encoder wants:
-# measured on real hardware at 640x480/6fps, the V4L2 MJPEG encoder
-# consistently delivers only ~19% of whatever bitrate it's handed --
-#   asked 2000 -> 8.2 KB/frame, 405 kbps actual
-#   asked 5000 -> 17.9 KB/frame, 882 kbps actual
-#   asked 10000 -> 41.5 KB/frame, 2041 kbps actual
-#   asked 20000 -> 73.6 KB/frame, 3618 kbps actual
-# -- a clean linear relationship, just heavily scaled down. Passing the
-# network budget straight through is what produced ~5 KB frames that
-# looked like a Mario Bros video game. Divide it out instead, so the
-# bytes that actually hit the wire match what was budgeted.
-# The exact ratio drifts with scene detail (measured 0.18-0.22 across
-# runs), so this errs on the high side deliberately: overshooting the
-# factor lands slightly UNDER budget, which is the safe direction for a
-# link the rest of the ranch is sharing.
-MJPEG_BITRATE_EFFICIENCY = 0.22
+# from real measured uplink headroom). It is NOT what this encoder wants.
+# Measured on real hardware at 640x480, JPEG size scales linearly with the
+# bitrate the encoder is handed, and -- critically -- is INDEPENDENT of
+# frame rate (a 2000 kbps setting produced 8.2 KB frames at both 113 fps
+# and 6 fps). Frame size and frame rate are therefore separate knobs:
+#   encoder 2768 -> 12.5 KB/frame      encoder 5000  -> 17.9 KB/frame
+#   encoder 3309 -> 12.3 KB/frame      encoder 20000 -> 73.6 KB/frame
+# Passing the network budget straight through is what produced the ~5 KB
+# frames that looked like a Mario Bros video game.
+# The ratio drifts with scene detail (~220-280 across runs); the low end
+# is used deliberately so the result lands at or under budget, the safe
+# direction on a link the rest of the ranch shares.
+MJPEG_KBPS_PER_FRAME_KB = 223
 MAX_ENCODER_BITRATE_KBPS = 20000
+
+
+def _plan_stream(budget_kbps):
+    """Choose frame rate + encoder bitrate for a given network budget.
+
+    Because per-frame size is set by the encoder's bitrate alone and does
+    not depend on frame rate, a shrinking budget does NOT have to wreck the
+    picture. Hold quality at STREAM_TARGET_FRAME_KB and spend whatever the
+    budget allows on frame RATE instead.
+
+    This is the fix for quality collapsing whenever the ranch's uplink dips.
+    With frame rate pinned at 6 fps, every lost kbps came out of image
+    quality: when upload fell 2.25 -> 1.07 Mbps the gate dropped the budget
+    to 374 kbps, which at 6 fps is ~7.8 KB/frame -- straight back into
+    artifact territory. For a mostly-static landscape, 3 clean frames per
+    second beat 6 blocky ones.
+
+    Returns (fps, encoder_kbps, frame_kb).
+    """
+    budget_bytes_s = budget_kbps * 1000 / 8
+    target_bytes = STREAM_TARGET_FRAME_KB * 1024
+    fps = budget_bytes_s / target_bytes
+
+    if fps > STREAM_MAX_FPS:
+        # Plenty of headroom: cap the rate, put the surplus into quality.
+        fps = STREAM_MAX_FPS
+        frame_bytes = budget_bytes_s / fps
+    elif fps < STREAM_MIN_FPS:
+        # Almost no budget: hold a floor rate and shrink frames to fit,
+        # rather than degrading to a still image.
+        fps = STREAM_MIN_FPS
+        frame_bytes = budget_bytes_s / fps
+    else:
+        frame_bytes = target_bytes
+
+    frame_kb = frame_bytes / 1024
+    encoder_kbps = int(frame_kb * MJPEG_KBPS_PER_FRAME_KB)
+    encoder_kbps = max(1, min(encoder_kbps, MAX_ENCODER_BITRATE_KBPS))
+    return fps, encoder_kbps, frame_kb
 
 # The camera's video configuration allows a 100us minimum frame duration,
 # i.e. well over 100 fps -- measured at ~113 fps on real hardware. Left
@@ -89,8 +125,12 @@ MAX_ENCODER_BITRATE_KBPS = 20000
 # mostly-static landscape: capping the frame rate while streaming gives
 # each frame a far larger share of the same budget (good-looking JPEGs)
 # AND brings actual bandwidth in line with what was requested.
-STREAM_FPS = 6
-STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
+STREAM_MAX_FPS = 6
+STREAM_MIN_FPS = 1.0
+# Per-frame quality floor. Measured at 640x480: ~5 KB is the unusable
+# "Mario Bros" look, 8 KB still visibly blocky, ~12 KB clean. Frame rate
+# is what flexes to fit the budget -- see _plan_stream().
+STREAM_TARGET_FRAME_KB = 12
 # Restored on stop -- must match sender.py's init_camera() configuration.
 # Only the MINIMUM is raised while streaming: the 15.1s maximum has to
 # stay put either way, since the night-mode still capture depends on it
@@ -264,12 +304,12 @@ def start_stream(bitrate_kbps, max_seconds):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
+        fps, encoder_kbps, frame_kb = _plan_stream(bitrate_kbps)
         # Cap the frame rate BEFORE starting the encoder so its rate control
         # is sized against the frame rate actually being produced.
         _picam2.set_controls({
-            "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
+            "FrameDurationLimits": (int(1_000_000 / fps), MAX_FRAME_DURATION_US)
         })
-        encoder_kbps = min(int(bitrate_kbps / MJPEG_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
         encoder = MJPEGEncoder(bitrate=encoder_kbps * 1000)
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name="lores")
 
@@ -287,9 +327,10 @@ def start_stream(bitrate_kbps, max_seconds):
 
         logger.info(
             f"Stream started @ {bitrate_kbps}kbps budget "
-            f"({encoder_kbps}kbps encoder, {STREAM_FPS}fps), hard cap {max_seconds}s"
+            f"({encoder_kbps}kbps encoder, {fps:.1f}fps, ~{frame_kb:.1f}KB/frame), "
+            f"hard cap {max_seconds}s"
         )
-        return {"status": "started", "bitrate_kbps": bitrate_kbps}
+        return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": round(fps, 1)}
 
 
 def stop_stream(reason="requested"):
