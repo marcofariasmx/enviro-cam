@@ -58,8 +58,23 @@ PROM_PATH = "/var/lib/prometheus/node-exporter/stream.prom"
 # request, independent of whatever bandwidth-gating logic main-pi5 applies
 # on its side.
 MIN_BITRATE_KBPS = 150
-MAX_BITRATE_KBPS = 20000
+MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
+
+# `bitrate_kbps` from the caller is a NETWORK budget (main-pi5 derives it
+# from real measured uplink headroom). It is NOT what this encoder wants:
+# measured on real hardware at 640x480/6fps, the V4L2 MJPEG encoder
+# consistently delivers only ~19% of whatever bitrate it's handed --
+#   asked 2000 -> 8.2 KB/frame, 405 kbps actual
+#   asked 5000 -> 17.9 KB/frame, 882 kbps actual
+#   asked 10000 -> 41.5 KB/frame, 2041 kbps actual
+#   asked 20000 -> 73.6 KB/frame, 3618 kbps actual
+# -- a clean linear relationship, just heavily scaled down. Passing the
+# network budget straight through is what produced ~5 KB frames that
+# looked like a Mario Bros video game. Divide it out instead, so the
+# bytes that actually hit the wire match what was budgeted.
+MJPEG_BITRATE_EFFICIENCY = 0.19
+MAX_ENCODER_BITRATE_KBPS = 20000
 
 # The camera's video configuration allows a 100us minimum frame duration,
 # i.e. well over 100 fps -- measured at ~113 fps on real hardware. Left
@@ -250,7 +265,8 @@ def start_stream(bitrate_kbps, max_seconds):
         _picam2.set_controls({
             "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
         })
-        encoder = MJPEGEncoder(bitrate=bitrate_kbps * 1000)
+        encoder_kbps = min(int(bitrate_kbps / MJPEG_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
+        encoder = MJPEGEncoder(bitrate=encoder_kbps * 1000)
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name="lores")
 
         _state.active = True
@@ -265,7 +281,10 @@ def start_stream(bitrate_kbps, max_seconds):
         timer.start()
         _state.deadline_timer = timer
 
-        logger.info(f"Stream started @ {bitrate_kbps}kbps, hard cap {max_seconds}s")
+        logger.info(
+            f"Stream started @ {bitrate_kbps}kbps budget "
+            f"({encoder_kbps}kbps encoder, {STREAM_FPS}fps), hard cap {max_seconds}s"
+        )
         return {"status": "started", "bitrate_kbps": bitrate_kbps}
 
 
