@@ -61,6 +61,24 @@ MIN_BITRATE_KBPS = 150
 MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
+# The camera's video configuration allows a 100us minimum frame duration,
+# i.e. well over 100 fps -- measured at ~113 fps on real hardware. Left
+# alone, the encoder spreads its bitrate budget across all of those frames
+# and every single one comes out a ~5 KB, heavily-artifacted 640x480 JPEG
+# ("looks like a Mario Bros video game"), while still pushing ~5 Mbps --
+# more than double the ranch's entire uplink. Nobody needs 113 fps of a
+# mostly-static landscape: capping the frame rate while streaming gives
+# each frame a far larger share of the same budget (good-looking JPEGs)
+# AND brings actual bandwidth in line with what was requested.
+STREAM_FPS = 6
+STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
+# Restored on stop -- must match sender.py's init_camera() configuration.
+# Only the MINIMUM is raised while streaming: the 15.1s maximum has to
+# stay put either way, since the night-mode still capture depends on it
+# to take its 15s manual exposure.
+IDLE_MIN_FRAME_DURATION_US = 100
+MAX_FRAME_DURATION_US = 15_100_000
+
 _CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered MJPEG at these bitrates
 
 # multipart/x-mixed-replace boundary token, shared between the framing
@@ -189,6 +207,15 @@ def _stop_locked(reason):
         _picam2.stop_encoder()
     except Exception as e:
         logger.warning(f"stop_encoder error: {e}")
+    try:
+        # Hand the camera back its unconstrained frame rate -- the still
+        # capture path shares this same Picamera2 instance and shouldn't be
+        # left running at streaming's reduced rate once nobody's watching.
+        _picam2.set_controls({
+            "FrameDurationLimits": (IDLE_MIN_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
+        })
+    except Exception as e:
+        logger.warning(f"FrameDurationLimits restore error: {e}")
 
     duration_s = time.monotonic() - _state.started_monotonic
     bytes_sent = _state.broadcaster.bytes_written
@@ -218,6 +245,11 @@ def start_stream(bitrate_kbps, max_seconds):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
+        # Cap the frame rate BEFORE starting the encoder so its rate control
+        # is sized against the frame rate actually being produced.
+        _picam2.set_controls({
+            "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
+        })
         encoder = MJPEGEncoder(bitrate=bitrate_kbps * 1000)
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name="lores")
 
