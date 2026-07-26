@@ -97,7 +97,17 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 H264_BITRATE_EFFICIENCY = 0.45
 MAX_ENCODER_BITRATE_KBPS = 6000
 
-# --- Constant-quantiser mode (the default) ---------------------------------
+# --- Constant-quantiser mode (available, NOT the default) ------------------
+#
+# MEASURED RESULT: this does NOT remove the keyframe pulse, so it is not the
+# default. Constant QP equalises the QUANTISER across I and P frames, but the
+# pulse does not come from unequal quantisation -- it comes from P-frames
+# ACCUMULATING refinement across the GOP (each adds residual detail on top of
+# the last), so by the 24th frame the picture is genuinely more refined than
+# any freshly-coded I-frame at the same QP can be. Measured drop at the
+# keyframe: ~9% under CBR, ~13.6% under constant QP -- slightly worse, and
+# constant QP additionally gives up the bitrate ceiling. Kept because the
+# `qp` override on /stream/start is useful for measurement.
 #
 # CBR rate control has a fixed number of bits to spend per second, and it
 # reaches that target by quantising the expensive I-frame much harder than
@@ -335,8 +345,6 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
         stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
-        if qp is None:
-            qp = _qp_for_budget(stream_name, bitrate_kbps)
         if qp is not None:
             # Constant-quantiser (VBR) mode: picamera2 pins the encoder's
             # MIN_QP and MAX_QP to this same value, so every frame -- I and
