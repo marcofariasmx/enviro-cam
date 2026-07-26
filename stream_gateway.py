@@ -51,6 +51,7 @@ depend on main-pi5's Prometheus successfully scraping at the right moment.
 """
 import io
 import json
+import math
 import logging
 import os
 import queue
@@ -95,6 +96,44 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 # the safe direction on a link the rest of the ranch shares.
 H264_BITRATE_EFFICIENCY = 0.45
 MAX_ENCODER_BITRATE_KBPS = 6000
+
+# --- Constant-quantiser mode (the default) ---------------------------------
+#
+# CBR rate control has a fixed number of bits to spend per second, and it
+# reaches that target by quantising the expensive I-frame much harder than
+# the cheap P-frames around it. The visible result at these bitrates is a
+# ~2s "heartbeat": the picture refines across the GOP as P-frames add
+# detail, then snaps back to a coarser baseline the moment the next
+# keyframe lands. This is a well-documented H.264 low-bitrate rate-control
+# limitation, not a bug in this code.
+#
+# Constant QP fixes it structurally: picamera2 pins MIN_QP and MAX_QP to the
+# same value, so every frame is quantised identically and there is no
+# quality step at the keyframe at all. The I-frame is still far larger in
+# BYTES (that is inherent), it is just no longer WORSE.
+#
+# The cost is that bitrate is no longer bounded by the encoder -- it now
+# floats with scene complexity (wind in the trees, moving cloud shadow).
+# Measured on real hardware, bitrate falls ~2.6x per +4 QP:
+#   1280x720:  qp24 -> 682 kbps   qp28 -> 248   qp32 -> 94   qp36 -> 43
+#    640x480:  qp24 -> 239 kbps   qp28 -> 103   qp32 -> 38
+# so QP is chosen from the budget below, deliberately aiming at only a
+# FRACTION of it. That headroom is what absorbs a complexity spike without
+# overrunning a link the rest of the ranch shares.
+QP_REF = 24
+QP_REF_KBPS = {"main": 682, "lores": 239}
+QP_KBPS_RATIO_PER_4 = 2.6   # bitrate multiplier per 4 QP steps (measured)
+QP_BUDGET_FRACTION = 0.65   # aim here, leaving room for scene complexity
+QP_MIN, QP_MAX = 20, 40
+
+
+def _qp_for_budget(stream_name, budget_kbps):
+    """Pick a constant quantiser that should land near
+    QP_BUDGET_FRACTION of the caller's budget for this resolution."""
+    ref = QP_REF_KBPS.get(stream_name, QP_REF_KBPS["lores"])
+    target = max(1.0, budget_kbps * QP_BUDGET_FRACTION)
+    qp = QP_REF + 4 * math.log(ref / target) / math.log(QP_KBPS_RATIO_PER_4)
+    return int(max(QP_MIN, min(QP_MAX, round(qp))))
 
 # Which camera stream to encode is chosen per session from the budget.
 # Both already exist in sender.py's configuration, so switching between
@@ -296,6 +335,8 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
         stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
+        if qp is None:
+            qp = _qp_for_budget(stream_name, bitrate_kbps)
         if qp is not None:
             # Constant-quantiser (VBR) mode: picamera2 pins the encoder's
             # MIN_QP and MAX_QP to this same value, so every frame -- I and
