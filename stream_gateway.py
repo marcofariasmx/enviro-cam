@@ -8,8 +8,8 @@ one process to hold the camera at a time (the "Device or resource busy"
 lesson, same one already learned with the Growatt inverter's Modbus port),
 so this is wired in as a background thread of sender.py's daemon rather
 than a separate service. See stream_feasibility findings: the still
-capture continues completely unaffected on the "main" stream while this
-module drives an encoder on the concurrent "lores" stream.
+capture continues completely unaffected while this module drives a
+concurrent encoder on the same camera.
 
 Transport is raw H.264 over a long-lived HTTP GET, broadcast to however
 many clients are connected (in practice just main-pi5, which packages it
@@ -83,15 +83,6 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 # passed through directly.
 STREAM_ENCODE_NAME = "main"  # 1280x720; see the module docstring
 
-# The camera's video configuration allows a 100us minimum frame duration,
-# i.e. well over 100 fps -- measured at ~113 fps on real hardware. Left
-# alone, the encoder spreads its bitrate budget across all of those frames
-# and every single one comes out a ~5 KB, heavily-artifacted 640x480 JPEG
-# ("looks like a Mario Bros video game"), while still pushing ~5 Mbps --
-# more than double the ranch's entire uplink. Nobody needs 113 fps of a
-# mostly-static landscape: capping the frame rate while streaming gives
-# each frame a far larger share of the same budget (good-looking JPEGs)
-# AND brings actual bandwidth in line with what was requested.
 # Frame rate no longer has to be traded against image quality: H.264's
 # inter-frame prediction makes additional frames of a near-static scene
 # almost free, which is the entire reason this moved off MJPEG. The cap
@@ -108,7 +99,6 @@ IDLE_MIN_FRAME_DURATION_US = 100
 MAX_FRAME_DURATION_US = 15_100_000
 
 _CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered H.264 at these bitrates
-
 
 
 class _Broadcaster(io.BufferedIOBase):
