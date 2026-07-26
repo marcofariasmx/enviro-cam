@@ -78,10 +78,23 @@ MIN_BITRATE_KBPS = 150
 MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
-# Unlike the MJPEG encoder this replaced -- which honoured only ~19-22% of
-# whatever bitrate it was handed and needed a fudge factor -- H.264's rate
-# control tracks its target closely, so the caller's network budget can be
-# passed through directly.
+# The Pi's V4L2 H.264 encoder substantially UNDERSHOOTS its bitrate target
+# on this content -- measured end to end:
+#   asked 200 kbps -> 83 actual (41%)
+#   asked 600 kbps -> 282 actual (47%)
+#   asked 1500 kbps -> 385 actual (26%, clearly saturating)
+# Passing the network budget through unscaled therefore spends only ~40% of
+# what the link can afford, and the encoder pays for that by crushing the
+# P-frames: measured 200-900 byte P-frames against a ~7 KB I-frame, a 10x
+# ratio. That is what produced the visible ~2s "heartbeat" -- each keyframe
+# arrives comparatively sharp and the starved frames after it visibly decay
+# until the next one resets the cycle. Scaling the request up fills the
+# budget and evens the frames out.
+# Deliberately conservative (the real ratio is 41-47% in the range we
+# actually operate in): overestimating the efficiency lands us UNDER budget,
+# the safe direction on a link the rest of the ranch shares.
+H264_BITRATE_EFFICIENCY = 0.45
+MAX_ENCODER_BITRATE_KBPS = 6000
 
 # Which camera stream to encode is chosen per session from the budget.
 # Both already exist in sender.py's configuration, so switching between
@@ -283,8 +296,9 @@ def start_stream(bitrate_kbps, max_seconds):
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
         stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
+        encoder_kbps = min(int(bitrate_kbps / H264_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
         encoder = H264Encoder(
-            bitrate=bitrate_kbps * 1000,
+            bitrate=encoder_kbps * 1000,
             repeat=True,
             iperiod=STREAM_FPS * STREAM_IFRAME_SECONDS,
             framerate=STREAM_FPS,
@@ -304,9 +318,9 @@ def start_stream(bitrate_kbps, max_seconds):
         _state.deadline_timer = timer
 
         logger.info(
-            f"Stream started (H.264 {stream_name}) @ {bitrate_kbps}kbps, "
-            f"{STREAM_FPS}fps, I-frame every {STREAM_IFRAME_SECONDS}s, "
-            f"hard cap {max_seconds}s"
+            f"Stream started (H.264 {stream_name}) @ {bitrate_kbps}kbps budget "
+            f"({encoder_kbps}kbps encoder), {STREAM_FPS}fps, "
+            f"I-frame every {STREAM_IFRAME_SECONDS}s, hard cap {max_seconds}s"
         )
         return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": STREAM_FPS}
 
