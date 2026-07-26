@@ -250,7 +250,21 @@ def start_stream(bitrate_kbps, max_seconds):
         _picam2.set_controls({
             "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
         })
-        encoder = H264Encoder(bitrate=bitrate_kbps * 1000)
+        # iperiod = one I-frame per second, and repeat=True so SPS/PPS ride
+        # along with every one of them. Both matter downstream:
+        #  - a consumer connecting mid-stream (main-pi5's ffmpeg always does)
+        #    gets "non-existing PPS 0 referenced" and decodes nothing until
+        #    the next IDR carrying headers. At the default ~5s I-frame
+        #    period that's a 5 second black wait on every single start.
+        #  - HLS segments can only be cut on an I-frame, so the I-frame
+        #    period is the floor on segment duration -- and segment duration
+        #    is what sets end-to-end latency.
+        encoder = H264Encoder(
+            bitrate=bitrate_kbps * 1000,
+            repeat=True,
+            iperiod=STREAM_FPS,
+            framerate=STREAM_FPS,
+        )
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name=STREAM_ENCODE_NAME)
 
         _state.active = True
