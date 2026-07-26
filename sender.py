@@ -364,13 +364,34 @@ def _mean_brightness(image_bytes):
     return sum(pixels) / len(pixels)
 
 
+def _await_exposure(picam2, target_us, timeout_s):
+    """Block until the camera is actually DELIVERING frames shot at
+    `target_us`, rather than sleeping and hoping.
+
+    Sleeping is not good enough, and getting this wrong produced solid-white
+    images in production. The pipeline can have a frame already in flight
+    that was exposed with the PREVIOUS settings, and when the previous
+    exposure was longer than the new one, a sleep sized to the *new*
+    exposure expires long before that old frame lands -- so capture_file()
+    hands back the stale, overexposed frame. Observed exactly that: after
+    dropping 15s -> 3s -> 0.6s -> 0.12s, every single reading came back 255
+    and each attempt still took ~15s of wall clock, because the camera was
+    never off its original 15s cadence.
+
+    capture_metadata() blocks until the next frame, so this paces itself
+    and works in BOTH directions.
+    """
+    deadline = time.monotonic() + timeout_s
+    tolerance = max(2_000, int(target_us * 0.15))
+    while time.monotonic() < deadline:
+        md = picam2.capture_metadata()
+        if abs(md.get("ExposureTime", 0) - target_us) <= tolerance:
+            return True
+    return False
+
+
 # Manual (low-light) exposure control. See capture_image_to_memory().
 LOW_LIGHT_GAIN_THRESHOLD = 4.0   # above this, auto-exposure is struggling
-# At/above this, auto-exposure has run out of road entirely (sensor max
-# gain is 16) -- its metered result is clipped and underexposed, so
-# preserving its brightness would just reproduce a too-dark frame. Genuine
-# darkness: start long and let the feedback loop pull back if needed.
-AE_CLIPPED_GAIN = 15.0
 NIGHT_GAIN_CAP = 8.0             # balances brightness vs noise (sensor max is 16)
 MIN_EXPOSURE_US = 1_000
 MAX_EXPOSURE_US = 15_000_000     # 15s; matches FrameDurationLimits' maximum
@@ -443,34 +464,39 @@ def capture_image_to_memory():
         # only add noise, and at dusk auto's gain is the more conservative
         # of the two.
         target_gain = min(NIGHT_GAIN_CAP, auto_gain)
-        if auto_gain >= AE_CLIPPED_GAIN:
-            # Auto-exposure is pinned at max gain and still underexposing --
-            # its reading is a floor, not a correct meter. This is real
-            # darkness, so open all the way up (what the old fixed-15s
-            # behaviour got right) and let the loop below walk it back if
-            # that turns out to be too much.
-            exposure = MAX_EXPOSURE_US
-        else:
-            # brightness ~ exposure x gain, so hold the product constant.
-            exposure = auto_exposure * auto_gain / target_gain
+        # ALWAYS start from what auto actually metered (brightness ~
+        # exposure x gain, so hold the product constant) and let the loop
+        # below walk UP if it turns out too dark.
+        #
+        # An earlier version jumped straight to the 15s maximum whenever
+        # auto's gain was pinned near its ceiling, on the theory that a
+        # pinned meter means genuine darkness. In production that fired at
+        # DUSK -- auto gain hit 15.5 while there was still plenty of light --
+        # and 15s blew the frame to solid white. Climbing up from a known-
+        # good exposure can only ever be too dark for an attempt or two;
+        # starting at the top can be catastrophically overexposed.
+        exposure = auto_exposure * auto_gain / target_gain
         exposure = int(max(MIN_EXPOSURE_US, min(MAX_EXPOSURE_US, exposure)))
 
         image_bytes = None
+        previous_exposure = auto_exposure
         for attempt in range(MAX_EXPOSURE_ATTEMPTS):
             picam2.set_controls({
                 "AeEnable": False,
                 "ExposureTime": exposure,
                 "AnalogueGain": target_gain,
             })
-            # In the continuous video-mode pipeline (needed for the
-            # concurrent stream feed), a frame shot under the OLD settings
-            # can still be queued when we ask for one -- capture would just
-            # hand that stale frame back instantly instead of one taken
-            # with what we just set. Wait past the requested exposure time
-            # so the frame we grab is guaranteed to be fresh. Confirmed on
-            # hardware: without this wait, AnalogueGain silently reports
-            # auto's last value instead of the requested one.
-            time.sleep(exposure / 1_000_000 + 1)
+            # Wait for the pipeline to actually be producing frames at this
+            # exposure. The budget has to cover flushing whatever frame is
+            # already in flight at the PREVIOUS (possibly much longer)
+            # exposure, plus taking a fresh one at the new setting.
+            settle_budget = (previous_exposure + exposure) / 1_000_000 * 2 + 5
+            if not _await_exposure(picam2, exposure, settle_budget):
+                logger.warning(
+                    f"Camera never settled at {exposure / 1_000_000:.2f}s "
+                    f"within {settle_budget:.0f}s -- reading may be stale"
+                )
+            previous_exposure = exposure
 
             buffer = io.BytesIO()
             picam2.capture_file(buffer, format='jpeg')
@@ -511,7 +537,16 @@ def capture_image_to_memory():
                 f"attempts (brightness {brightness:.0f}) -- falling back to auto"
             )
             picam2.set_controls({"AeEnable": True})
-            time.sleep(1.5)
+            # Same stale-frame trap as above, and the original 1.5s sleep
+            # walked straight into it: the fallback frame came back at the
+            # manual 15s exposure and was itself blown. Auto picks its own
+            # exposure, so wait for the reported value to actually move off
+            # the manual one instead of guessing a duration.
+            deadline = time.monotonic() + (exposure / 1_000_000) * 2 + 8
+            while time.monotonic() < deadline:
+                md = picam2.capture_metadata()
+                if abs(md.get("ExposureTime", 0) - exposure) > max(2_000, exposure * 0.15):
+                    break
             buffer = io.BytesIO()
             picam2.capture_file(buffer, format='jpeg')
             image_bytes = buffer.getvalue()
