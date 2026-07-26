@@ -11,18 +11,34 @@ than a separate service. See stream_feasibility findings: the still
 capture continues completely unaffected on the "main" stream while this
 module drives an encoder on the concurrent "lores" stream.
 
-Transport is MJPEG (multipart/x-mixed-replace), broadcast to however many
-clients are connected (in practice just main-pi5, which fans it out
-byte-for-byte to browser viewers -- see the monitor-cam-webapp side).
-This replaced an earlier H264-over-ffmpeg-remux-into-fragmented-MP4 design
-that main-pi5 fed through MediaSource/appendBuffer client-side: that
-combination is a well-documented source of silent, hard-to-diagnose
-failures (CHUNK_DEMUXER_ERROR_APPEND_FAILED and related stalls with no
-error ever surfacing) and, on reconnect, never even got the request off
-the browser reliably. MJPEG via a plain <img> tag needs no client-side
-media pipeline at all -- multipart/x-mixed-replace has been handled
-natively by every browser for decades, and each frame is retrieved from
-each viewer, avoiding this whole bug class rather than patching around it.
+Transport is raw H.264 over a long-lived HTTP GET, broadcast to however
+many clients are connected (in practice just main-pi5, which packages it
+into HLS for browsers -- see the monitor-cam-webapp side).
+
+Codec history, because this has moved twice and the reasons matter:
+  1. H.264 -> ffmpeg -> fragmented MP4 -> MediaSource/appendBuffer in the
+     browser. The transport was fine; the CLIENT side was not -- Chrome's
+     CHUNK_DEMUXER_ERROR_APPEND_FAILED class of failures throws nothing and
+     logs nothing, so it presented only as "connects once, then never
+     again." Abandoned.
+  2. MJPEG over multipart/x-mixed-replace, rendered by a plain <img>. Dead
+     simple and genuinely reliable -- but MJPEG is intra-only: every frame
+     is a whole JPEG, so a near-static landscape re-sends ~99% identical
+     pixels forever. On the ranch's ~1-2 Mbps uplink that capped us at
+     640x480, and it still looked soft. Compression was no longer the
+     limit; resolution was.
+  3. (now) H.264 again -- but delivered as HLS, packaged by ffmpeg on
+     main-pi5 and played by hls.js/native Safari. H.264's inter-frame
+     prediction is ~10-20x more efficient than MJPEG on a static scene,
+     which is what buys 1280x720 inside the same budget. The lesson from
+     (1) was never "H.264 is bad", it was "don't hand-roll the browser-side
+     media pipeline" -- hls.js is a battle-tested library, not our code.
+
+Encoding runs on the "main" 1280x720 stream, deliberately NOT on "lores":
+that leaves sender.py's camera configuration completely untouched, so the
+5-minute still capture (including its 15s night exposure) carries no risk
+from a streaming change.
+
 Bitrate and the hard session-duration cap are both supplied by the caller
 (main-pi5 decides bitrate from real uplink headroom); this module just
 enforces sane bounds and never trusts the caller's numbers blindly.
@@ -42,7 +58,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from picamera2.encoders import MJPEGEncoder
+from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
 
 import stream_storage
@@ -61,60 +77,11 @@ MIN_BITRATE_KBPS = 150
 MAX_BITRATE_KBPS = 2000
 MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 
-# `bitrate_kbps` from the caller is a NETWORK budget (main-pi5 derives it
-# from real measured uplink headroom). It is NOT what this encoder wants.
-# Measured on real hardware at 640x480, JPEG size scales linearly with the
-# bitrate the encoder is handed, and -- critically -- is INDEPENDENT of
-# frame rate (a 2000 kbps setting produced 8.2 KB frames at both 113 fps
-# and 6 fps). Frame size and frame rate are therefore separate knobs:
-#   encoder 2768 -> 12.5 KB/frame      encoder 5000  -> 17.9 KB/frame
-#   encoder 3309 -> 12.3 KB/frame      encoder 20000 -> 73.6 KB/frame
-# Passing the network budget straight through is what produced the ~5 KB
-# frames that looked like a Mario Bros video game.
-# The ratio drifts with scene detail (~220-280 across runs); the low end
-# is used deliberately so the result lands at or under budget, the safe
-# direction on a link the rest of the ranch shares.
-MJPEG_KBPS_PER_FRAME_KB = 223
-MAX_ENCODER_BITRATE_KBPS = 20000
-
-
-def _plan_stream(budget_kbps):
-    """Choose frame rate + encoder bitrate for a given network budget.
-
-    Because per-frame size is set by the encoder's bitrate alone and does
-    not depend on frame rate, a shrinking budget does NOT have to wreck the
-    picture. Hold quality at STREAM_TARGET_FRAME_KB and spend whatever the
-    budget allows on frame RATE instead.
-
-    This is the fix for quality collapsing whenever the ranch's uplink dips.
-    With frame rate pinned at 6 fps, every lost kbps came out of image
-    quality: when upload fell 2.25 -> 1.07 Mbps the gate dropped the budget
-    to 374 kbps, which at 6 fps is ~7.8 KB/frame -- straight back into
-    artifact territory. For a mostly-static landscape, 3 clean frames per
-    second beat 6 blocky ones.
-
-    Returns (fps, encoder_kbps, frame_kb).
-    """
-    budget_bytes_s = budget_kbps * 1000 / 8
-    target_bytes = STREAM_TARGET_FRAME_KB * 1024
-    fps = budget_bytes_s / target_bytes
-
-    if fps > STREAM_MAX_FPS:
-        # Plenty of headroom: cap the rate, put the surplus into quality.
-        fps = STREAM_MAX_FPS
-        frame_bytes = budget_bytes_s / fps
-    elif fps < STREAM_MIN_FPS:
-        # Almost no budget: hold a floor rate and shrink frames to fit,
-        # rather than degrading to a still image.
-        fps = STREAM_MIN_FPS
-        frame_bytes = budget_bytes_s / fps
-    else:
-        frame_bytes = target_bytes
-
-    frame_kb = frame_bytes / 1024
-    encoder_kbps = int(frame_kb * MJPEG_KBPS_PER_FRAME_KB)
-    encoder_kbps = max(1, min(encoder_kbps, MAX_ENCODER_BITRATE_KBPS))
-    return fps, encoder_kbps, frame_kb
+# Unlike the MJPEG encoder this replaced -- which honoured only ~19-22% of
+# whatever bitrate it was handed and needed a fudge factor -- H.264's rate
+# control tracks its target closely, so the caller's network budget can be
+# passed through directly.
+STREAM_ENCODE_NAME = "main"  # 1280x720; see the module docstring
 
 # The camera's video configuration allows a 100us minimum frame duration,
 # i.e. well over 100 fps -- measured at ~113 fps on real hardware. Left
@@ -125,12 +92,14 @@ def _plan_stream(budget_kbps):
 # mostly-static landscape: capping the frame rate while streaming gives
 # each frame a far larger share of the same budget (good-looking JPEGs)
 # AND brings actual bandwidth in line with what was requested.
-STREAM_MAX_FPS = 6
-STREAM_MIN_FPS = 1.0
-# Per-frame quality floor. Measured at 640x480: ~5 KB is the unusable
-# "Mario Bros" look, 8 KB still visibly blocky, ~12 KB clean. Frame rate
-# is what flexes to fit the budget -- see _plan_stream().
-STREAM_TARGET_FRAME_KB = 12
+# Frame rate no longer has to be traded against image quality: H.264's
+# inter-frame prediction makes additional frames of a near-static scene
+# almost free, which is the entire reason this moved off MJPEG. The cap
+# exists only because the camera's video config allows a 100us minimum
+# frame duration -- measured ~113 fps on real hardware -- and nobody needs
+# 113 fps of a landscape.
+STREAM_FPS = 12
+STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
 # Restored on stop -- must match sender.py's init_camera() configuration.
 # Only the MINIMUM is raised while streaming: the 15.1s maximum has to
 # stay put either way, since the night-mode still capture depends on it
@@ -138,13 +107,8 @@ STREAM_TARGET_FRAME_KB = 12
 IDLE_MIN_FRAME_DURATION_US = 100
 MAX_FRAME_DURATION_US = 15_100_000
 
-_CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered MJPEG at these bitrates
+_CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered H.264 at these bitrates
 
-# multipart/x-mixed-replace boundary token, shared between the framing
-# written here and the Content-Type header both this module's own HTTP
-# handler and main-pi5's relay give to browsers -- must match exactly.
-MULTIPART_BOUNDARY = b"FRAME"
-MULTIPART_CONTENT_TYPE = f"multipart/x-mixed-replace; boundary={MULTIPART_BOUNDARY.decode()}"
 
 
 class _Broadcaster(io.BufferedIOBase):
@@ -157,17 +121,10 @@ class _Broadcaster(io.BufferedIOBase):
     the hard way when a plain object here silently killed every stream
     start attempt.
 
-    Each write() call from the encoder is exactly one complete JPEG frame
-    (picamera2's encoder/FileOutput contract) -- wrapping it in its own
-    multipart part here, once, means every consumer (main-pi5's single
-    upstream connection today, or a hypothetical direct viewer later)
-    receives an already-correctly-framed byte stream it can just forward
-    verbatim. A viewer joining mid-stream simply lands inside this
-    boundary-delimited sequence and renders from the next full frame --
-    multipart parsers (browsers included) treat anything before the first
-    boundary match as discardable preamble, so no separate "cache the
-    first chunk for late joiners" logic (needed for fMP4's init segment)
-    is required here.
+    Raw H.264 passes through untouched: the only consumer is main-pi5's
+    ffmpeg, which parses the Annex-B byte stream itself and needs no
+    framing added here. (The MJPEG version this replaced wrapped each frame
+    in a multipart part; H.264 has no such per-frame boundary to add.)
     """
 
     def __init__(self):
@@ -191,26 +148,20 @@ class _Broadcaster(io.BufferedIOBase):
                 self._clients.remove(q)
 
     def write(self, buf):
-        frame = bytes(buf)
-        packet = (
-            b"--" + MULTIPART_BOUNDARY + b"\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
-            frame + b"\r\n"
-        )
+        data = bytes(buf)
         with self._lock:
             clients = list(self._clients)
-            self.bytes_written += len(packet)
+            self.bytes_written += len(data)
         for q in clients:
             try:
-                q.put_nowait(packet)
+                q.put_nowait(data)
             except queue.Full:
                 try:
                     q.get_nowait()
-                    q.put_nowait(packet)
+                    q.put_nowait(data)
                 except queue.Empty:
                     pass
-        return len(frame)
+        return len(data)
 
     def flush(self):
         pass
@@ -304,14 +255,13 @@ def start_stream(bitrate_kbps, max_seconds):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
-        fps, encoder_kbps, frame_kb = _plan_stream(bitrate_kbps)
         # Cap the frame rate BEFORE starting the encoder so its rate control
         # is sized against the frame rate actually being produced.
         _picam2.set_controls({
-            "FrameDurationLimits": (int(1_000_000 / fps), MAX_FRAME_DURATION_US)
+            "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
         })
-        encoder = MJPEGEncoder(bitrate=encoder_kbps * 1000)
-        _picam2.start_encoder(encoder, FileOutput(broadcaster), name="lores")
+        encoder = H264Encoder(bitrate=bitrate_kbps * 1000)
+        _picam2.start_encoder(encoder, FileOutput(broadcaster), name=STREAM_ENCODE_NAME)
 
         _state.active = True
         _state.started_monotonic = time.monotonic()
@@ -326,11 +276,10 @@ def start_stream(bitrate_kbps, max_seconds):
         _state.deadline_timer = timer
 
         logger.info(
-            f"Stream started @ {bitrate_kbps}kbps budget "
-            f"({encoder_kbps}kbps encoder, {fps:.1f}fps, ~{frame_kb:.1f}KB/frame), "
-            f"hard cap {max_seconds}s"
+            f"Stream started (H.264 {STREAM_ENCODE_NAME}) @ {bitrate_kbps}kbps, "
+            f"{STREAM_FPS}fps, hard cap {max_seconds}s"
         )
-        return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": round(fps, 1)}
+        return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": STREAM_FPS}
 
 
 def stop_stream(reason="requested"):
@@ -369,7 +318,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._json(200, {"status": "ok", **status()})
 
-        if self.path == "/stream/mjpeg":
+        if self.path == "/stream/raw.h264":
             if not self._authed():
                 return self._json(401, {"error": "bad api key"})
             with _state.lock:
@@ -378,7 +327,7 @@ class _Handler(BaseHTTPRequestHandler):
                 broadcaster = _state.broadcaster
                 q = broadcaster.register()
             self.send_response(200)
-            self.send_header("Content-Type", MULTIPART_CONTENT_TYPE)
+            self.send_header("Content-Type", "video/h264")
             self.end_headers()
             try:
                 while True:
