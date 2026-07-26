@@ -34,10 +34,11 @@ Codec history, because this has moved twice and the reasons matter:
      (1) was never "H.264 is bad", it was "don't hand-roll the browser-side
      media pipeline" -- hls.js is a battle-tested library, not our code.
 
-Encoding runs on the "main" 1280x720 stream, deliberately NOT on "lores":
-that leaves sender.py's camera configuration completely untouched, so the
-5-minute still capture (including its 15s night exposure) carries no risk
-from a streaming change.
+Encoding picks between the camera's existing "main" (1280x720) and "lores"
+(640x480) streams based on the budget -- see HD_MIN_BITRATE_KBPS. Both are
+already configured by sender.py, so this never reconfigures the camera,
+which keeps the 5-minute still capture (and its 15s night exposure) fully
+out of the blast radius of any streaming change.
 
 Bitrate and the hard session-duration cap are both supplied by the caller
 (main-pi5 decides bitrate from real uplink headroom); this module just
@@ -81,7 +82,20 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 # whatever bitrate it was handed and needed a fudge factor -- H.264's rate
 # control tracks its target closely, so the caller's network budget can be
 # passed through directly.
-STREAM_ENCODE_NAME = "main"  # 1280x720; see the module docstring
+
+# Which camera stream to encode is chosen per session from the budget.
+# Both already exist in sender.py's configuration, so switching between
+# them costs nothing and -- crucially -- needs no camera reconfiguration,
+# which would put the 5-minute still capture at risk.
+#
+# 1280x720 needs real bitrate to be worth it. Measured on a 192 kbps
+# budget (the ranch's uplink had fallen to 0.6 Mbps), 720p came back
+# visibly smeared -- worse to look at than a clean lower resolution would
+# be. Below the threshold, encode the 640x480 stream instead and spend the
+# whole budget on making *it* clean.
+HD_STREAM_NAME = "main"    # 1280x720
+SD_STREAM_NAME = "lores"   # 640x480
+HD_MIN_BITRATE_KBPS = 500
 
 # Frame rate no longer has to be traded against image quality: H.264's
 # inter-frame prediction makes additional frames of a near-static scene
@@ -91,6 +105,15 @@ STREAM_ENCODE_NAME = "main"  # 1280x720; see the module docstring
 # 113 fps of a landscape.
 STREAM_FPS = 12
 STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
+# Seconds between I-frames. This is a direct quality/latency trade and it
+# matters far more than it looks on a link this thin: an I-frame is coded
+# from scratch, and a 720p one can cost more bits than an entire second of
+# a 192 kbps budget -- so keyframing every second forced rate control to
+# starve everything in between, which is exactly the smearing that showed
+# up in testing. Every 2s halves that overhead. It also sets the floor on
+# HLS segment duration (segments can only be cut on an I-frame), and hence
+# on latency, so it should not grow without reason.
+STREAM_IFRAME_SECONDS = 2
 # Restored on stop -- must match sender.py's init_camera() configuration.
 # Only the MINIMUM is raised while streaming: the 15.1s maximum has to
 # stay put either way, since the night-mode still capture depends on it
@@ -259,13 +282,14 @@ def start_stream(bitrate_kbps, max_seconds):
         #  - HLS segments can only be cut on an I-frame, so the I-frame
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
+        stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
         encoder = H264Encoder(
             bitrate=bitrate_kbps * 1000,
             repeat=True,
-            iperiod=STREAM_FPS,
+            iperiod=STREAM_FPS * STREAM_IFRAME_SECONDS,
             framerate=STREAM_FPS,
         )
-        _picam2.start_encoder(encoder, FileOutput(broadcaster), name=STREAM_ENCODE_NAME)
+        _picam2.start_encoder(encoder, FileOutput(broadcaster), name=stream_name)
 
         _state.active = True
         _state.started_monotonic = time.monotonic()
@@ -280,8 +304,9 @@ def start_stream(bitrate_kbps, max_seconds):
         _state.deadline_timer = timer
 
         logger.info(
-            f"Stream started (H.264 {STREAM_ENCODE_NAME}) @ {bitrate_kbps}kbps, "
-            f"{STREAM_FPS}fps, hard cap {max_seconds}s"
+            f"Stream started (H.264 {stream_name}) @ {bitrate_kbps}kbps, "
+            f"{STREAM_FPS}fps, I-frame every {STREAM_IFRAME_SECONDS}s, "
+            f"hard cap {max_seconds}s"
         )
         return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": STREAM_FPS}
 
