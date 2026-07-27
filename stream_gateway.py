@@ -51,7 +51,6 @@ depend on main-pi5's Prometheus successfully scraping at the right moment.
 """
 import io
 import json
-import math
 import logging
 import os
 import queue
@@ -61,10 +60,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from picamera2.encoders import H264Encoder
-from picamera2.encoders.h264_encoder import (
-    V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
-    V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
-)
 from picamera2.outputs import FileOutput
 
 import stream_storage
@@ -101,53 +96,13 @@ MAX_SESSION_SECONDS = 20 * 60  # 20 min hard cap per session
 H264_BITRATE_EFFICIENCY = 0.45
 MAX_ENCODER_BITRATE_KBPS = 6000
 
-# --- Constant-quantiser mode (available, NOT the default) ------------------
-#
-# MEASURED RESULT: this does NOT remove the keyframe pulse, so it is not the
-# default. Constant QP equalises the QUANTISER across I and P frames, but the
-# pulse does not come from unequal quantisation -- it comes from P-frames
-# ACCUMULATING refinement across the GOP (each adds residual detail on top of
-# the last), so by the 24th frame the picture is genuinely more refined than
-# any freshly-coded I-frame at the same QP can be. Measured drop at the
-# keyframe: ~9% under CBR, ~13.6% under constant QP -- slightly worse, and
-# constant QP additionally gives up the bitrate ceiling. Kept because the
-# `qp` override on /stream/start is useful for measurement.
-#
-# CBR rate control has a fixed number of bits to spend per second, and it
-# reaches that target by quantising the expensive I-frame much harder than
-# the cheap P-frames around it. The visible result at these bitrates is a
-# ~2s "heartbeat": the picture refines across the GOP as P-frames add
-# detail, then snaps back to a coarser baseline the moment the next
-# keyframe lands. This is a well-documented H.264 low-bitrate rate-control
-# limitation, not a bug in this code.
-#
-# Constant QP fixes it structurally: picamera2 pins MIN_QP and MAX_QP to the
-# same value, so every frame is quantised identically and there is no
-# quality step at the keyframe at all. The I-frame is still far larger in
-# BYTES (that is inherent), it is just no longer WORSE.
-#
-# The cost is that bitrate is no longer bounded by the encoder -- it now
-# floats with scene complexity (wind in the trees, moving cloud shadow).
-# Measured on real hardware, bitrate falls ~2.6x per +4 QP:
-#   1280x720:  qp24 -> 682 kbps   qp28 -> 248   qp32 -> 94   qp36 -> 43
-#    640x480:  qp24 -> 239 kbps   qp28 -> 103   qp32 -> 38
-# so QP is chosen from the budget below, deliberately aiming at only a
-# FRACTION of it. That headroom is what absorbs a complexity spike without
-# overrunning a link the rest of the ranch shares.
-QP_REF = 24
-QP_REF_KBPS = {"main": 682, "lores": 239}
-QP_KBPS_RATIO_PER_4 = 2.6   # bitrate multiplier per 4 QP steps (measured)
-QP_BUDGET_FRACTION = 0.65   # aim here, leaving room for scene complexity
-QP_MIN, QP_MAX = 20, 40
-
-
-def _qp_for_budget(stream_name, budget_kbps):
-    """Pick a constant quantiser that should land near
-    QP_BUDGET_FRACTION of the caller's budget for this resolution."""
-    ref = QP_REF_KBPS.get(stream_name, QP_REF_KBPS["lores"])
-    target = max(1.0, budget_kbps * QP_BUDGET_FRACTION)
-    qp = QP_REF + 4 * math.log(ref / target) / math.log(QP_KBPS_RATIO_PER_4)
-    return int(max(QP_MIN, min(QP_MAX, round(qp))))
+# Constant-quantiser (qp) mode was tried and REMOVED. It equalises the
+# quantiser across I and P frames, but the keyframe pulse comes from
+# P-frames accumulating refinement, not from unequal quantisation --
+# measured ~13.6% drop versus ~9% for CBR, i.e. worse. It also discards the
+# bitrate ceiling that protects the ranch's uplink. Same verdict for a QP
+# *range*: `12-40` produced a 0 kbps stream and `8-45` produced 1062 kbps
+# against a 400 kbps budget. Neither is safe to expose. See homelab-map.
 
 # Which camera stream to encode is chosen per session from the budget.
 # Both already exist in sender.py's configuration, so switching between
@@ -170,7 +125,6 @@ HD_MIN_BITRATE_KBPS = 500
 # frame duration -- measured ~113 fps on real hardware -- and nobody needs
 # 113 fps of a landscape.
 STREAM_FPS = 12
-STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
 # Frame rate used when the budget is thin, alongside the drop to 640x480.
 #
 # This is about the KEYFRAME PULSE, not about bandwidth. Measured in
@@ -340,7 +294,7 @@ def _stop_locked(reason):
     _state.broadcaster = None
 
 
-def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None, qp_range=None):
+def start_stream(bitrate_kbps, max_seconds, fps=None):
     """Idempotent: returns the current session info whether or not this
     call actually started a new one."""
     bitrate_kbps = max(MIN_BITRATE_KBPS, min(MAX_BITRATE_KBPS, int(bitrate_kbps)))
@@ -362,8 +316,8 @@ def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None, qp_range=None):
         _picam2.set_controls({
             "FrameDurationLimits": (int(1_000_000 / fps), MAX_FRAME_DURATION_US)
         })
-        # iperiod = one I-frame per second, and repeat=True so SPS/PPS ride
-        # along with every one of them. Both matter downstream:
+        # iperiod = one I-frame every STREAM_IFRAME_SECONDS, and repeat=True
+        # so SPS/PPS ride along with every one of them. Both matter downstream:
         #  - a consumer connecting mid-stream (main-pi5's ffmpeg always does)
         #    gets "non-existing PPS 0 referenced" and decodes nothing until
         #    the next IDR carrying headers. At the default ~5s I-frame
@@ -371,44 +325,13 @@ def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None, qp_range=None):
         #  - HLS segments can only be cut on an I-frame, so the I-frame
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
-        if qp is not None:
-            # Constant-quantiser (VBR) mode: picamera2 pins the encoder's
-            # MIN_QP and MAX_QP to this same value, so every frame -- I and
-            # P alike -- is quantised identically. That is what removes the
-            # keyframe pulse; CBR rate control instead has to spend a fixed
-            # bit budget per second and reaches it by quantising the
-            # expensive I-frame harder than the cheap P-frames around it.
-            qp = max(1, min(51, int(qp)))
-            encoder_kbps = None
-            encoder = H264Encoder(
-                bitrate=None,
-                qp=qp,
-                repeat=True,
-                iperiod=fps * STREAM_IFRAME_SECONDS,
-                framerate=fps,
-            )
-        else:
-            encoder_kbps = min(int(bitrate_kbps / H264_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
-            encoder = H264Encoder(
-                bitrate=encoder_kbps * 1000,
-                repeat=True,
-                iperiod=fps * STREAM_IFRAME_SECONDS,
-                framerate=fps,
-            )
-        if qp_range is not None:
-            # A QP *range*, not a fixed value. picamera2 only ever pins
-            # MIN_QP == MAX_QP (its `qp` argument) and otherwise leaves both
-            # at driver defaults (0/51), so the rate control is never told
-            # how far it may go to protect an expensive frame. Widening the
-            # floor is the closest thing this hardware has to x264's
-            # ipratio: it lets the encoder spend a much lower QP on the
-            # I-frame while holding the P-frames coarser, which is exactly
-            # the asymmetry the keyframe pulse needs.
-            lo, hi = qp_range
-            encoder._controls += [
-                (V4L2_CID_MPEG_VIDEO_H264_MIN_QP, int(lo)),
-                (V4L2_CID_MPEG_VIDEO_H264_MAX_QP, int(hi)),
-            ]
+        encoder_kbps = min(int(bitrate_kbps / H264_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
+        encoder = H264Encoder(
+            bitrate=encoder_kbps * 1000,
+            repeat=True,
+            iperiod=fps * STREAM_IFRAME_SECONDS,
+            framerate=fps,
+        )
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name=stream_name)
 
         _state.active = True
@@ -425,7 +348,7 @@ def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None, qp_range=None):
 
         logger.info(
             f"Stream started (H.264 {stream_name}) @ {bitrate_kbps}kbps budget "
-            f"({'qp=' + str(qp) if qp is not None else str(encoder_kbps) + 'kbps encoder'}), "
+            f"({encoder_kbps}kbps encoder), "
             f"{fps}fps, I-frame every {STREAM_IFRAME_SECONDS}s, "
             f"hard cap {max_seconds}s"
         )
@@ -505,10 +428,12 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/stream/start":
             bitrate_kbps = body.get("bitrate_kbps", MIN_BITRATE_KBPS)
             max_seconds = body.get("max_seconds", 300)
-            qp = body.get("qp")    # optional overrides, for tuning/measurement
+            # `fps` is an optional override kept for measurement; it is
+            # bounded and cannot bypass the bitrate ceiling. The `qp` and
+            # `qp_range` overrides that used to live here were removed --
+            # both could disable that ceiling (see the note above).
             fps = body.get("fps")
-            qp_range = body.get("qp_range")   # [min, max]
-            return self._json(200, start_stream(bitrate_kbps, max_seconds, qp, fps, qp_range))
+            return self._json(200, start_stream(bitrate_kbps, max_seconds, fps))
 
         if self.path == "/stream/stop":
             return self._json(200, stop_stream("requested"))
