@@ -61,6 +61,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from picamera2.encoders import H264Encoder
+from picamera2.encoders.h264_encoder import (
+    V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
+    V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
+)
 from picamera2.outputs import FileOutput
 
 import stream_storage
@@ -336,7 +340,7 @@ def _stop_locked(reason):
     _state.broadcaster = None
 
 
-def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None):
+def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None, qp_range=None):
     """Idempotent: returns the current session info whether or not this
     call actually started a new one."""
     bitrate_kbps = max(MIN_BITRATE_KBPS, min(MAX_BITRATE_KBPS, int(bitrate_kbps)))
@@ -391,6 +395,20 @@ def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None):
                 iperiod=fps * STREAM_IFRAME_SECONDS,
                 framerate=fps,
             )
+        if qp_range is not None:
+            # A QP *range*, not a fixed value. picamera2 only ever pins
+            # MIN_QP == MAX_QP (its `qp` argument) and otherwise leaves both
+            # at driver defaults (0/51), so the rate control is never told
+            # how far it may go to protect an expensive frame. Widening the
+            # floor is the closest thing this hardware has to x264's
+            # ipratio: it lets the encoder spend a much lower QP on the
+            # I-frame while holding the P-frames coarser, which is exactly
+            # the asymmetry the keyframe pulse needs.
+            lo, hi = qp_range
+            encoder._controls += [
+                (V4L2_CID_MPEG_VIDEO_H264_MIN_QP, int(lo)),
+                (V4L2_CID_MPEG_VIDEO_H264_MAX_QP, int(hi)),
+            ]
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name=stream_name)
 
         _state.active = True
@@ -489,7 +507,8 @@ class _Handler(BaseHTTPRequestHandler):
             max_seconds = body.get("max_seconds", 300)
             qp = body.get("qp")    # optional overrides, for tuning/measurement
             fps = body.get("fps")
-            return self._json(200, start_stream(bitrate_kbps, max_seconds, qp, fps))
+            qp_range = body.get("qp_range")   # [min, max]
+            return self._json(200, start_stream(bitrate_kbps, max_seconds, qp, fps, qp_range))
 
         if self.path == "/stream/stop":
             return self._json(200, stop_stream("requested"))
