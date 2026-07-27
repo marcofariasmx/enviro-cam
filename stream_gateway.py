@@ -167,6 +167,23 @@ HD_MIN_BITRATE_KBPS = 500
 # 113 fps of a landscape.
 STREAM_FPS = 12
 STREAM_FRAME_DURATION_US = int(1_000_000 / STREAM_FPS)
+# Frame rate used when the budget is thin, alongside the drop to 640x480.
+#
+# This is about the KEYFRAME PULSE, not about bandwidth. Measured in
+# daylight at a 400 kbps budget, the quality drop at each keyframe was:
+#     12 fps (24-frame GOP) -> 14.4%
+#      6 fps (12-frame GOP) ->  6.7%
+#      3 fps  (6-frame GOP) ->  3.7%
+# Note the bits PER FRAME were identical in all three (~30 kbit; this
+# encoder holds a fixed ~0.096 bits/pixel quality ceiling and simply emits
+# less data at lower frame rates -- more bitrate does not raise it, which
+# is the same saturation seen when asking 1500 kbps and getting 385).
+# So the pulse does not shrink because frames get more bits. It shrinks
+# because a shorter GOP accumulates less P-frame refinement, leaving less
+# for the next keyframe to throw away. Fewer frames per GOP = smaller step.
+# At a healthy budget the pulse measured 0.0% at 12 fps, so this only
+# applies when the link is already forcing us down to 640x480.
+STREAM_FPS_LOW_BUDGET = 6
 # Seconds between I-frames. This is a direct quality/latency trade and it
 # matters far more than it looks on a link this thin: an I-frame is coded
 # from scratch, and a 720p one can cost more bits than an entire second of
@@ -330,8 +347,12 @@ def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
-        fps = STREAM_FPS if fps is None else max(1, min(30, int(fps)))
-        stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
+        hd = bitrate_kbps >= HD_MIN_BITRATE_KBPS
+        stream_name = HD_STREAM_NAME if hd else SD_STREAM_NAME
+        if fps is None:
+            fps = STREAM_FPS if hd else STREAM_FPS_LOW_BUDGET
+        else:
+            fps = max(1, min(30, int(fps)))
         # Cap the frame rate BEFORE starting the encoder so its rate control
         # is sized against the frame rate actually being produced.
         _picam2.set_controls({
