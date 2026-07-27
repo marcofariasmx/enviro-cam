@@ -319,7 +319,7 @@ def _stop_locked(reason):
     _state.broadcaster = None
 
 
-def start_stream(bitrate_kbps, max_seconds, qp=None):
+def start_stream(bitrate_kbps, max_seconds, qp=None, fps=None):
     """Idempotent: returns the current session info whether or not this
     call actually started a new one."""
     bitrate_kbps = max(MIN_BITRATE_KBPS, min(MAX_BITRATE_KBPS, int(bitrate_kbps)))
@@ -330,10 +330,12 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
 
         broadcaster = _Broadcaster()
+        fps = STREAM_FPS if fps is None else max(1, min(30, int(fps)))
+        stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
         # Cap the frame rate BEFORE starting the encoder so its rate control
         # is sized against the frame rate actually being produced.
         _picam2.set_controls({
-            "FrameDurationLimits": (STREAM_FRAME_DURATION_US, MAX_FRAME_DURATION_US)
+            "FrameDurationLimits": (int(1_000_000 / fps), MAX_FRAME_DURATION_US)
         })
         # iperiod = one I-frame per second, and repeat=True so SPS/PPS ride
         # along with every one of them. Both matter downstream:
@@ -344,7 +346,6 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
         #  - HLS segments can only be cut on an I-frame, so the I-frame
         #    period is the floor on segment duration -- and segment duration
         #    is what sets end-to-end latency.
-        stream_name = HD_STREAM_NAME if bitrate_kbps >= HD_MIN_BITRATE_KBPS else SD_STREAM_NAME
         if qp is not None:
             # Constant-quantiser (VBR) mode: picamera2 pins the encoder's
             # MIN_QP and MAX_QP to this same value, so every frame -- I and
@@ -358,16 +359,16 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
                 bitrate=None,
                 qp=qp,
                 repeat=True,
-                iperiod=STREAM_FPS * STREAM_IFRAME_SECONDS,
-                framerate=STREAM_FPS,
+                iperiod=fps * STREAM_IFRAME_SECONDS,
+                framerate=fps,
             )
         else:
             encoder_kbps = min(int(bitrate_kbps / H264_BITRATE_EFFICIENCY), MAX_ENCODER_BITRATE_KBPS)
             encoder = H264Encoder(
                 bitrate=encoder_kbps * 1000,
                 repeat=True,
-                iperiod=STREAM_FPS * STREAM_IFRAME_SECONDS,
-                framerate=STREAM_FPS,
+                iperiod=fps * STREAM_IFRAME_SECONDS,
+                framerate=fps,
             )
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name=stream_name)
 
@@ -386,10 +387,10 @@ def start_stream(bitrate_kbps, max_seconds, qp=None):
         logger.info(
             f"Stream started (H.264 {stream_name}) @ {bitrate_kbps}kbps budget "
             f"({'qp=' + str(qp) if qp is not None else str(encoder_kbps) + 'kbps encoder'}), "
-            f"{STREAM_FPS}fps, I-frame every {STREAM_IFRAME_SECONDS}s, "
+            f"{fps}fps, I-frame every {STREAM_IFRAME_SECONDS}s, "
             f"hard cap {max_seconds}s"
         )
-        return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": STREAM_FPS}
+        return {"status": "started", "bitrate_kbps": bitrate_kbps, "fps": fps}
 
 
 def stop_stream(reason="requested"):
@@ -465,8 +466,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/stream/start":
             bitrate_kbps = body.get("bitrate_kbps", MIN_BITRATE_KBPS)
             max_seconds = body.get("max_seconds", 300)
-            qp = body.get("qp")  # optional override, for tuning/measurement
-            return self._json(200, start_stream(bitrate_kbps, max_seconds, qp))
+            qp = body.get("qp")    # optional overrides, for tuning/measurement
+            fps = body.get("fps")
+            return self._json(200, start_stream(bitrate_kbps, max_seconds, qp, fps))
 
         if self.path == "/stream/stop":
             return self._json(200, stop_stream("requested"))
