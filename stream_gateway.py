@@ -388,6 +388,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/camera/metadata":
+            # Diagnostic: what the camera is actually doing right now.
+            # Added to investigate a night-time tone/brightness flicker --
+            # sampling ExposureTime/AnalogueGain/ColourGains over time is
+            # the only way to tell AE hunting apart from AWB hunting.
+            if not self._authed():
+                return self._json(401, {"error": "bad api key"})
+            try:
+                md = _picam2.capture_metadata()
+            except Exception as e:
+                return self._json(503, {"error": str(e)})
+            keep = ("ExposureTime", "AnalogueGain", "DigitalGain", "ColourGains",
+                    "Lux", "FrameDuration", "AeLocked", "ColourTemperature")
+            return self._json(200, {k: md.get(k) for k in keep if k in md})
+
         if self.path == "/health":
             return self._json(200, {"status": "ok", **status()})
 
