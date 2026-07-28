@@ -480,6 +480,7 @@ def capture_image_to_memory():
 
         image_bytes = None
         previous_exposure = auto_exposure
+        previous_brightness = None
         for attempt in range(MAX_EXPOSURE_ATTEMPTS):
             picam2.set_controls({
                 "AeEnable": False,
@@ -510,6 +511,25 @@ def capture_image_to_memory():
             )
             if BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX:
                 break
+
+            # Stop chasing a target the scene cannot reach. On a genuinely
+            # dark night the frame legitimately meters below the band, and
+            # more exposure stops buying signal: observed 4.80s -> 10.37s
+            # producing brightness 60 both times, so that attempt cost 43
+            # wasted seconds of shutter for an identical picture. If a
+            # longer exposure did not actually get brighter, take what we
+            # have -- a dim but real night frame is the correct answer, and
+            # pushing further would only blow out the village lights.
+            if (previous_brightness is not None
+                    and brightness > previous_brightness
+                    and brightness - previous_brightness < 3
+                    and brightness < BRIGHTNESS_MIN):
+                logger.info(
+                    f"Exposure no longer buying brightness "
+                    f"({previous_brightness:.0f} -> {brightness:.0f}); keeping this frame"
+                )
+                break
+            previous_brightness = brightness
 
             if brightness >= BRIGHTNESS_CLIPPED:
                 # A blown-out frame reads 255 no matter how far over it is,
