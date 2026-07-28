@@ -208,6 +208,47 @@ def calculate_air_quality(gas_resistance):
     return round(max(0.0, min(100.0, score)), 1)
 
 
+def get_camera_light_data():
+    """Illuminance and colour temperature, derived from the camera's own
+    auto-exposure metering. The BME680 has no light sensor, so this is the
+    only light measurement the ranch has.
+
+    Image brightness is NOT a light measurement: auto exposure compensates,
+    so a dark scene and a bright one both come out mid-grey. What IS a
+    measurement is the exposure and gain the AE algorithm had to choose to
+    get there, which is what libcamera turns into its Lux estimate. Measured
+    range on this camera: 11,707 lux at clear noon down to 0.12 at night --
+    a ~100,000x span that tracks physics exactly (tiny exposure and minimum
+    gain by day, long exposure and maximum gain at night).
+
+    Deliberately read HERE, in the sensor path, which runs before
+    capture_image_to_memory() takes manual control at night: once AeEnable
+    is False the reported Lux is no longer the algorithm's live estimate and
+    stops meaning anything.
+
+    Caveats worth remembering before trusting a number: this is an estimate
+    from the AE algorithm over whatever is in frame, not a calibrated
+    photometer, and it measures the framed scene rather than the hemisphere
+    a pyranometer would see. Treat it as a consistent RELATIVE measure --
+    excellent for trends and for correlating against solar production,
+    not as absolute lux.
+    """
+    picam2 = init_camera()
+    if picam2 is None:
+        return {}
+    try:
+        md = picam2.capture_metadata()
+    except Exception as e:
+        logger.warning(f"Could not read camera light data: {e}")
+        return {}
+    out = {}
+    if md.get("Lux") is not None:
+        out["lux"] = round(float(md["Lux"]), 2)
+    if md.get("ColourTemperature") is not None:
+        out["colour_temperature_k"] = int(md["ColourTemperature"])
+    return out
+
+
 def get_local_sensor_data():
     """Read data from local BME680 sensor."""
     sensor = init_sensor()
@@ -859,6 +900,13 @@ def run_once(config: dict):
 
     # Collect sensor data
     sensor_data = get_local_sensor_data()
+    # Light comes from the camera, not the BME680 -- and must be sampled
+    # before the image capture puts the camera into manual exposure.
+    light_data = get_camera_light_data()
+    if light_data:
+        if sensor_data is None:
+            sensor_data = {}
+        sensor_data.update(light_data)
     esp32_data = get_esp32_data()
 
     # Queue sensor data
