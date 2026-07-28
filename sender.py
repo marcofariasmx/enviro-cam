@@ -394,7 +394,14 @@ def _await_exposure(picam2, target_us, timeout_s):
 LOW_LIGHT_GAIN_THRESHOLD = 4.0   # above this, auto-exposure is struggling
 NIGHT_GAIN_CAP = 8.0             # balances brightness vs noise (sensor max is 16)
 MIN_EXPOSURE_US = 1_000
-MAX_EXPOSURE_US = 15_000_000     # 15s; matches FrameDurationLimits' maximum
+# 5s, NOT the 15s the frame-duration limit would allow. Measured across two
+# consecutive night cycles: 4.80s produced mean luma 59-60, and 10.4-10.5s
+# produced 60 again -- more than doubling the shutter bought nothing at all.
+# Raspberry Pi's stack is known to misbehave past ~5s exposures
+# (raspberrypi/picamera2#1309), and this matches. Capping here means a night
+# capture finishes in ~25s instead of ~70s for an identical picture, which
+# matters because it runs inside a 5-minute cycle.
+MAX_EXPOSURE_US = 5_000_000
 # Acceptable mean-luma band for a manual exposure, and what we aim for when
 # correcting. Deliberately wide -- this is a "not blown out, not black"
 # check, not an attempt to art-direct every frame.
