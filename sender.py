@@ -409,6 +409,9 @@ BRIGHTNESS_TARGET = 130
 BRIGHTNESS_MIN = 85
 BRIGHTNESS_MAX = 175
 BRIGHTNESS_CLIPPED = 250  # at/above this the frame is blown; see the loop
+# Below this, after actually LOOKING at a frame, the scene is genuinely dark
+# rather than merely dim -- see the "measure, then jump" note in the loop.
+BRIGHTNESS_REALLY_DARK = 20
 # From a nearly black scene the per-step growth is capped at 6x, so
 # reaching the 15s ceiling from a ~0.1s starting estimate takes four steps
 # (0.13 -> 0.78 -> 4.7 -> 15). Five gives that headroom plus one to settle.
@@ -473,6 +476,28 @@ def capture_image_to_memory():
             )
             return image_bytes
 
+        # Freeze white balance for the whole manual sequence.
+        #
+        # Measured in the timelapse: at 01:30 local -- deep night, nothing in
+        # the scene changing -- consecutive 5-minute frames swung R/B from
+        # 0.97 to 0.61 and straight back to 0.98. A landscape does not change
+        # colour like that; auto white balance was landing somewhere
+        # different each capture. Worse, during the manual exposure ramp the
+        # image brightness changes by orders of magnitude between attempts,
+        # so AWB is chasing a moving target and whatever it happens to hold
+        # at capture time is arbitrary. That is a visible strobe in a
+        # timelapse, where consecutive frames are compared directly.
+        #
+        # Same fix that took the live stream's colour swing to exactly 0:
+        # lock the gains the scene metered under auto exposure, before the
+        # ramp starts, and restore auto afterwards.
+        try:
+            gains = metadata.get("ColourGains")
+            if gains:
+                picam2.set_controls({"AwbEnable": False, "ColourGains": tuple(gains)})
+        except Exception as e:
+            logger.warning(f"Could not lock AWB for capture: {e}")
+
         # Never gain up beyond what auto already chose -- raising gain would
         # only add noise, and at dusk auto's gain is the more conservative
         # of the two.
@@ -524,6 +549,23 @@ def capture_image_to_memory():
             if BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX:
                 break
 
+
+            # Measure first, THEN jump. Climbing at the capped 6x per step
+            # cannot cross the range this camera needs: metered at 0.02s, five
+            # steps only reach 3.6s, and the old fixed-15s code was therefore
+            # roughly 4x brighter at night -- which is exactly the "night used
+            # to be visible" regression. But jumping to the ceiling on gain
+            # alone is what burned every dusk frame, because gain pins at max
+            # while there is still plenty of light.
+            #
+            # Looking at a real frame first separates the two cases
+            # unambiguously: at dusk attempt 1 comes back bright, so no jump;
+            # in real darkness it comes back near black, and only then do we
+            # open all the way. Landing on the same ceiling every cycle is
+            # also what keeps consecutive night frames consistent.
+            if brightness < BRIGHTNESS_REALLY_DARK and exposure < MAX_EXPOSURE_US:
+                exposure = MAX_EXPOSURE_US
+                continue
 
             if brightness >= BRIGHTNESS_CLIPPED:
                 # A blown-out frame reads 255 no matter how far over it is,
@@ -582,7 +624,7 @@ def capture_image_to_memory():
         # stream and every subsequent capture.
         if is_low_light:
             try:
-                picam2.set_controls({"AeEnable": True})
+                picam2.set_controls({"AeEnable": True, "AwbEnable": True})
             except Exception:
                 pass
 
