@@ -142,6 +142,24 @@ STREAM_FPS = 12
 # At a healthy budget the pulse measured 0.0% at 12 fps, so this only
 # applies when the link is already forcing us down to 640x480.
 STREAM_FPS_LOW_BUDGET = 6
+
+# Auto-white-balance is LOCKED for the duration of a streaming session.
+#
+# Measured on real hardware at night (Lux 0.12, gain pinned at its 16.0
+# ceiling): exposure and gain were rock steady -- ExposureTime sat at
+# exactly 66655us sample after sample -- but the colour gains never
+# settled, swinging R 1.62-1.70 and B 2.38-2.51, i.e. a colour temperature
+# wandering over a ~260K range (3589-3851K) continuously. In a dark scene
+# the eye is very sensitive to that, and it reads as the picture endlessly
+# "recalibrating black" -- an on/off tone flicker. It is chromatic, not
+# luminance: nothing to do with exposure.
+#
+# Freezing AWB at whatever the scene actually metered when the session
+# started keeps the colour correct while making it STOP moving. Sessions
+# are capped at 10 minutes, so there is no meaningful window for real
+# lighting to drift away from the locked value. Restored on stop so the
+# 5-minute still capture keeps full auto white balance.
+AWB_SETTLE_READS = 3
 # Seconds between I-frames. This is a direct quality/latency trade and it
 # matters far more than it looks on a link this thin: an I-frame is coded
 # from scratch, and a 720p one can cost more bits than an entire second of
@@ -268,6 +286,12 @@ def _stop_locked(reason):
     except Exception as e:
         logger.warning(f"stop_encoder error: {e}")
     try:
+        # Hand white balance back to auto -- the 5-minute still capture
+        # should keep adapting to real light.
+        _picam2.set_controls({"AwbEnable": True})
+    except Exception as e:
+        logger.warning(f"AWB restore error: {e}")
+    try:
         # Hand the camera back its unconstrained frame rate -- the still
         # capture path shares this same Picamera2 instance and shouldn't be
         # left running at streaming's reduced rate once nobody's watching.
@@ -333,6 +357,19 @@ def start_stream(bitrate_kbps, max_seconds, fps=None):
             framerate=fps,
         )
         _picam2.start_encoder(encoder, FileOutput(broadcaster), name=stream_name)
+
+        # Lock AWB to what the scene metered just now -- see AWB_SETTLE_READS.
+        try:
+            gains = None
+            for _ in range(AWB_SETTLE_READS):
+                md = _picam2.capture_metadata()
+                if md.get("ColourGains"):
+                    gains = md["ColourGains"]
+            if gains:
+                _picam2.set_controls({"AwbEnable": False, "ColourGains": tuple(gains)})
+                logger.info(f"AWB locked at ColourGains {tuple(round(g, 3) for g in gains)}")
+        except Exception as e:
+            logger.warning(f"Could not lock AWB (stream continues, tone may drift): {e}")
 
         _state.active = True
         _state.started_monotonic = time.monotonic()
