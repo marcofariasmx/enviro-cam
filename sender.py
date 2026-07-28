@@ -394,14 +394,14 @@ def _await_exposure(picam2, target_us, timeout_s):
 LOW_LIGHT_GAIN_THRESHOLD = 4.0   # above this, auto-exposure is struggling
 NIGHT_GAIN_CAP = 8.0             # balances brightness vs noise (sensor max is 16)
 MIN_EXPOSURE_US = 1_000
-# 5s, NOT the 15s the frame-duration limit would allow. Measured across two
-# consecutive night cycles: 4.80s produced mean luma 59-60, and 10.4-10.5s
-# produced 60 again -- more than doubling the shutter bought nothing at all.
-# Raspberry Pi's stack is known to misbehave past ~5s exposures
-# (raspberrypi/picamera2#1309), and this matches. Capping here means a night
-# capture finishes in ~25s instead of ~70s for an identical picture, which
-# matters because it runs inside a 5-minute cycle.
-MAX_EXPOSURE_US = 5_000_000
+# 15s, matching FrameDurationLimits' maximum.
+#
+# This was briefly capped at 5s on the strength of one dusk measurement
+# where 4.80s and 10.5s both metered luma ~60. That did not generalise: at
+# real darkness (3am, no moon) the scene needs every bit of the range, and
+# capping it made night frames far darker. Do not re-cap this without
+# measuring at ACTUAL night, not at dusk.
+MAX_EXPOSURE_US = 15_000_000
 # Acceptable mean-luma band for a manual exposure, and what we aim for when
 # correcting. Deliberately wide -- this is a "not blown out, not black"
 # check, not an attempt to art-direct every frame.
@@ -409,7 +409,13 @@ BRIGHTNESS_TARGET = 130
 BRIGHTNESS_MIN = 85
 BRIGHTNESS_MAX = 175
 BRIGHTNESS_CLIPPED = 250  # at/above this the frame is blown; see the loop
-MAX_EXPOSURE_ATTEMPTS = 4
+# From a nearly black scene the per-step growth is capped at 6x, so
+# reaching the 15s ceiling from a ~0.1s starting estimate takes four steps
+# (0.13 -> 0.78 -> 4.7 -> 15). Five gives that headroom plus one to settle.
+# Converging to the SAME place every cycle is what keeps consecutive night
+# frames consistent -- an exposure that stops at a different point each
+# time is exactly what produced a strobe in the timelapse.
+MAX_EXPOSURE_ATTEMPTS = 5
 
 
 def capture_image_to_memory():
@@ -487,7 +493,6 @@ def capture_image_to_memory():
 
         image_bytes = None
         previous_exposure = auto_exposure
-        previous_brightness = None
         for attempt in range(MAX_EXPOSURE_ATTEMPTS):
             picam2.set_controls({
                 "AeEnable": False,
@@ -519,24 +524,6 @@ def capture_image_to_memory():
             if BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX:
                 break
 
-            # Stop chasing a target the scene cannot reach. On a genuinely
-            # dark night the frame legitimately meters below the band, and
-            # more exposure stops buying signal: observed 4.80s -> 10.37s
-            # producing brightness 60 both times, so that attempt cost 43
-            # wasted seconds of shutter for an identical picture. If a
-            # longer exposure did not actually get brighter, take what we
-            # have -- a dim but real night frame is the correct answer, and
-            # pushing further would only blow out the village lights.
-            if (previous_brightness is not None
-                    and brightness > previous_brightness
-                    and brightness - previous_brightness < 3
-                    and brightness < BRIGHTNESS_MIN):
-                logger.info(
-                    f"Exposure no longer buying brightness "
-                    f"({previous_brightness:.0f} -> {brightness:.0f}); keeping this frame"
-                )
-                break
-            previous_brightness = brightness
 
             if brightness >= BRIGHTNESS_CLIPPED:
                 # A blown-out frame reads 255 no matter how far over it is,
