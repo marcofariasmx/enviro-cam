@@ -453,6 +453,16 @@ BRIGHTNESS_CLIPPED = 250  # at/above this the frame is blown; see the loop
 # Below this, after actually LOOKING at a frame, the scene is genuinely dark
 # rather than merely dim -- see the "measure, then jump" note in the loop.
 BRIGHTNESS_REALLY_DARK = 20
+# Intermediate rung on the way to the ceiling. Committing straight to 15s is
+# an expensive bet: at 15s every frame TAKES 15s, so backing out costs a
+# minute or more. That is fine at dusk, where light is falling and the first
+# metered frame already looks correct, but at DAWN light rises fast enough
+# that a frame metered dark is overexposed by the time a 15s shutter closes
+# -- observed 05:45, brightness 255 and five wasted attempts, each reading
+# stale because the pipeline could not turn a 15s exposure around inside the
+# settle budget. Probing at 3s first costs deep night one extra attempt and
+# keeps dawn from ever making that bet.
+EXPOSURE_PROBE_US = 3_000_000
 # From a nearly black scene the per-step growth is capped at 6x, so
 # reaching the 15s ceiling from a ~0.1s starting estimate takes four steps
 # (0.13 -> 0.78 -> 4.7 -> 15). Five gives that headroom plus one to settle.
@@ -604,9 +614,14 @@ def capture_image_to_memory():
             # in real darkness it comes back near black, and only then do we
             # open all the way. Landing on the same ceiling every cycle is
             # also what keeps consecutive night frames consistent.
-            if brightness < BRIGHTNESS_REALLY_DARK and exposure < MAX_EXPOSURE_US:
-                exposure = MAX_EXPOSURE_US
-                continue
+            if brightness < BRIGHTNESS_REALLY_DARK:
+                # Step up a rung at a time -- see EXPOSURE_PROBE_US.
+                if exposure < EXPOSURE_PROBE_US:
+                    exposure = EXPOSURE_PROBE_US
+                    continue
+                if exposure < MAX_EXPOSURE_US:
+                    exposure = MAX_EXPOSURE_US
+                    continue
 
             if brightness >= BRIGHTNESS_CLIPPED:
                 # A blown-out frame reads 255 no matter how far over it is,
