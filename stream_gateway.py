@@ -160,6 +160,12 @@ STREAM_FPS_LOW_BUDGET = 6
 # lighting to drift away from the locked value. Restored on stop so the
 # 5-minute still capture keeps full auto white balance.
 AWB_SETTLE_READS = 3
+# ...but bounded in wall clock too, not just in frames. capture_metadata()
+# blocks until the next frame COMPLETES, and a frame is only 1/fps long
+# once the camera is actually running at streaming speed. Coming out of a
+# night still capture a frame can be 15 seconds, so three reads is 45
+# seconds of a caller that main-pi5 gives up on after 10.
+AWB_SETTLE_TIMEOUT_S = 3.0
 # Seconds between I-frames. This is a direct quality/latency trade and it
 # matters far more than it looks on a link this thin: an I-frame is coded
 # from scratch, and a 720p one can cost more bits than an entire second of
@@ -170,11 +176,94 @@ AWB_SETTLE_READS = 3
 # on latency, so it should not grow without reason.
 STREAM_IFRAME_SECONDS = 2
 # Restored on stop -- must match sender.py's init_camera() configuration.
-# Only the MINIMUM is raised while streaming: the 15.1s maximum has to
-# stay put either way, since the night-mode still capture depends on it
-# to take its 15s manual exposure.
+# The 15.1s maximum is what lets the night-mode still capture take its 15s
+# manual exposure, so putting it back is not optional; a session that ended
+# without restoring it would cap the next night's stills at
+# STREAM_MAX_FRAME_DURATION_US and quietly ruin them.
 IDLE_MIN_FRAME_DURATION_US = 100
 MAX_FRAME_DURATION_US = 15_100_000
+# The frame-duration ceiling while a session is live -- a floor of 5fps on
+# the picture actually reaching the viewer.
+#
+# The streaming path used to pass MAX_FRAME_DURATION_US here, which is
+# correct for the still capture and useless for video: in darkness
+# auto-exposure opens all the way up, so the "12fps" stream produced a new
+# frame every several seconds. Measured on a real night session: 43 KB sent
+# in 13 seconds against a 1200 kbps budget, i.e. a still picture. A live
+# view is worth more grainy than frozen, so bound the exposure here and let
+# gain carry the rest of the darkness.
+STREAM_MAX_FRAME_DURATION_US = 200_000
+
+# The camera has exactly one owner at a time.
+#
+# One Picamera2 instance is shared by two writers: this gateway, and the
+# 5-minute still capture over in sender.py. Nothing mutually excluded them,
+# and at night -- where the still capture takes MANUAL control for up to two
+# minutes of every five while its exposure ramp climbs to 15s -- that broke
+# both directions at once:
+#
+#   - start_stream()'s AWB settle blocked for three 15s frames, far past
+#     main-pi5's 10s HTTP timeout, so the viewer got a bare 502.
+#   - Any session that did start inherited those multi-second frames.
+#   - And the stream stole frames back from the ramp's _await_exposure(),
+#     which then gave up and metered a stale one: "attempt 3 @ 8.08s ->
+#     brightness 48", the identical reading to attempt 2 @ 3.00s.
+#
+# Whoever holds this owns the camera's controls. The still capture is the
+# priority -- it is the archive, the stream is best-effort -- so it preempts
+# a live session rather than queueing behind one.
+camera_lock = threading.RLock()
+# How long start_stream() waits on that lock before reporting the camera
+# busy. Deliberately well under the relay's HTTP timeout: a prompt "busy,
+# try again" is worth much more to the browser than a timeout.
+CAMERA_BUSY_WAIT_S = 4.0
+# What we tell the caller to wait. A night still capture runs ~2 minutes,
+# but it is nearly always partway through by the time anyone asks, and
+# retrying costs one cheap request -- so retry often rather than making a
+# viewer who arrived at the tail end of one sit out the whole window.
+CAMERA_BUSY_RETRY_S = 10
+
+# A camera that has just taken a 15s night still cannot stream yet, and
+# there is no control that makes it able to.
+#
+# Coming off a multi-second cadence costs the frames already in the
+# pipeline, and they run at the OLD duration: measured 73 seconds to get
+# back to a short exposure after a 15s still, with the streaming
+# frame-duration ceiling applied the whole time and ignored throughout.
+# Handing exposure back to auto does not help, nor does driving it back
+# manually -- both were tried and measured. It is queue latency, not a
+# setting.
+#
+# So a session started inside that window does not stream badly, it streams
+# nothing: 0 bytes over 12 seconds, 28 KB over 90. Refusing to start is
+# strictly better than starting a dead one -- the caller retries, and gets
+# a session that actually carries picture.
+#
+# Estimated rather than measured because measuring means capture_metadata(),
+# which blocks for a whole frame and would itself take 15 seconds here.
+RECOVERY_FRAMES = 6
+MAX_RECOVERY_S = 120.0
+
+_camera_ready_at = 0.0  # time.monotonic()
+_ready_lock = threading.Lock()
+
+
+def note_long_exposure(exposure_us):
+    """Told by the still capture what exposure it just used, so streaming
+    can hold off until the sensor is off that cadence. See RECOVERY_FRAMES."""
+    global _camera_ready_at
+    recovery_s = min(MAX_RECOVERY_S, RECOVERY_FRAMES * exposure_us / 1_000_000)
+    with _ready_lock:
+        _camera_ready_at = time.monotonic() + recovery_s
+    logger.info(
+        f"Camera coming off a {exposure_us / 1_000_000:.1f}s exposure -- "
+        f"holding streaming off for {recovery_s:.0f}s"
+    )
+
+
+def _camera_recovery_remaining_s():
+    with _ready_lock:
+        return max(0.0, _camera_ready_at - time.monotonic())
 
 _CLIENT_QUEUE_MAXSIZE = 300  # ~a few seconds of buffered H.264 at these bitrates
 
@@ -324,6 +413,27 @@ def start_stream(bitrate_kbps, max_seconds, fps=None):
     bitrate_kbps = max(MIN_BITRATE_KBPS, min(MAX_BITRATE_KBPS, int(bitrate_kbps)))
     max_seconds = max(10, min(MAX_SESSION_SECONDS, int(max_seconds)))
 
+    # The still capture owns the camera while it runs -- see camera_lock.
+    if not camera_lock.acquire(timeout=CAMERA_BUSY_WAIT_S):
+        logger.info("Stream start refused: the 5-minute still capture holds the camera")
+        return {"status": "camera_busy", "retry_after_s": CAMERA_BUSY_RETRY_S}
+    try:
+        # Checked while holding the lock: the capture publishes this in its
+        # own teardown, so reading it any earlier can race the value.
+        recovering_s = _camera_recovery_remaining_s()
+        if recovering_s > 0:
+            logger.info(
+                f"Stream start held off: camera still coming off the still "
+                f"capture's long exposure ({recovering_s:.0f}s left)"
+            )
+            return {"status": "camera_busy", "retry_after_s": int(recovering_s) + 2}
+        return _start_stream_locked(bitrate_kbps, max_seconds, fps)
+    finally:
+        camera_lock.release()
+
+
+def _start_stream_locked(bitrate_kbps, max_seconds, fps):
+    """Caller must hold camera_lock."""
     with _state.lock:
         if _state.active:
             return {"status": "already_active", "bitrate_kbps": _state.bitrate_kbps}
@@ -337,8 +447,23 @@ def start_stream(bitrate_kbps, max_seconds, fps=None):
             fps = max(1, min(30, int(fps)))
         # Cap the frame rate BEFORE starting the encoder so its rate control
         # is sized against the frame rate actually being produced.
+        #
+        # Belt and braces on exposure: zero means "auto decides", and this
+        # clears any manual value still pinned on the shared camera.
+        #
+        # It is not sufficient on its own -- a sensor already running a
+        # multi-second cadence stays on it regardless of what AE is told,
+        # which is why the night capture flushes the camera back to a short
+        # exposure before releasing it (see RELEASE_EXPOSURE_US in
+        # sender.py). This covers the case where a capture died before it
+        # got that far.
         _picam2.set_controls({
-            "FrameDurationLimits": (int(1_000_000 / fps), MAX_FRAME_DURATION_US)
+            "AeEnable": True,
+            "ExposureTime": 0,
+            "AnalogueGain": 0.0,
+        })
+        _picam2.set_controls({
+            "FrameDurationLimits": (int(1_000_000 / fps), STREAM_MAX_FRAME_DURATION_US)
         })
         # iperiod = one I-frame every STREAM_IFRAME_SECONDS, and repeat=True
         # so SPS/PPS ride along with every one of them. Both matter downstream:
@@ -361,7 +486,11 @@ def start_stream(bitrate_kbps, max_seconds, fps=None):
         # Lock AWB to what the scene metered just now -- see AWB_SETTLE_READS.
         try:
             gains = None
+            deadline = time.monotonic() + AWB_SETTLE_TIMEOUT_S
             for _ in range(AWB_SETTLE_READS):
+                if time.monotonic() >= deadline:
+                    logger.info("AWB settle cut short by its time budget")
+                    break
                 md = _picam2.capture_metadata()
                 if md.get("ColourGains"):
                     gains = md["ColourGains"]
@@ -396,6 +525,20 @@ def stop_stream(reason="requested"):
     with _state.lock:
         _stop_locked(reason)
         return {"status": "stopped"}
+
+
+def stop_stream_for_capture():
+    """Preempt any live session so the 5-minute still can take the camera.
+
+    Called by sender.py while it holds camera_lock. Returns whether there
+    was actually a session to tear down, so the caller can say so in the
+    log. The archive wins over the live view; the browser reconnects on its
+    own once the capture is done.
+    """
+    with _state.lock:
+        was_active = _state.active
+        _stop_locked("still_capture")
+        return was_active
 
 
 def status():

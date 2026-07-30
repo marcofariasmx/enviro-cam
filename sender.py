@@ -470,6 +470,10 @@ EXPOSURE_PROBE_US = 3_000_000
 # frames consistent -- an exposure that stops at a different point each
 # time is exactly what produced a strobe in the timelapse.
 MAX_EXPOSURE_ATTEMPTS = 5
+# How long a capture waits for the live stream to hand the camera back.
+# Generous: the gateway's own hold is bounded by a few seconds of session
+# setup, so this only ever expires if something is genuinely stuck.
+CAMERA_LOCK_WAIT_S = 30.0
 
 
 def capture_image_to_memory():
@@ -505,6 +509,26 @@ def capture_image_to_memory():
         return None
 
     is_low_light = False
+    # The longest exposure actually driven onto the sensor, so the teardown
+    # can tell the gateway how long the camera will take to come off that
+    # cadence -- see stream_gateway.note_long_exposure().
+    last_manual_exposure_us = 0
+    # Take the camera for the whole capture -- see stream_gateway.camera_lock.
+    # Held even on the daylight path, which costs a second or two: a stream
+    # start that lands inside it gets told the camera is busy instead of
+    # racing us for frames.
+    #
+    # Bounded, and we go ahead without it if it never comes. The gateway only
+    # ever holds this for a few seconds of session setup, so waiting this long
+    # means something is wedged -- and a capture racing a stream is a bad
+    # photo, while a capture that blocks here forever is the end of the
+    # sensor loop as well. Degrade, don't stall.
+    held = stream_gateway.camera_lock.acquire(timeout=CAMERA_LOCK_WAIT_S)
+    if not held:
+        logger.warning(
+            f"Camera lock not released within {CAMERA_LOCK_WAIT_S:.0f}s -- "
+            f"capturing anyway; this image may be metered off a stale frame"
+        )
     try:
         # Let auto-exposure analyze the scene first
         time.sleep(0.5)
@@ -526,6 +550,19 @@ def capture_image_to_memory():
                 f"gain={final_metadata.get('AnalogueGain', 1.0):.1f})"
             )
             return image_bytes
+
+        # Drop any live session before taking manual control.
+        #
+        # The ramp below owns the camera for up to two minutes at night, and
+        # a stream running through it corrupts both: the stream inherits the
+        # ramp's multi-second exposures and freezes, while stealing frames
+        # from _await_exposure() so the ramp meters stale ones. Holding
+        # camera_lock stops a NEW session from starting; this stops one that
+        # was already running. Tearing it down also restores the camera's
+        # idle frame-duration limits, which is what makes the 15s exposure
+        # reachable at all.
+        if stream_gateway.stop_stream_for_capture():
+            logger.info("Live stream preempted for the 5-minute still capture")
 
         # Freeze white balance for the whole manual sequence.
         #
@@ -586,6 +623,7 @@ def capture_image_to_memory():
                     f"within {settle_budget:.0f}s -- reading may be stale"
                 )
             previous_exposure = exposure
+            last_manual_exposure_us = max(last_manual_exposure_us, exposure)
 
             buffer = io.BytesIO()
             picam2.capture_file(buffer, format='jpeg')
@@ -680,9 +718,30 @@ def capture_image_to_memory():
         # stream and every subsequent capture.
         if is_low_light:
             try:
-                picam2.set_controls({"AeEnable": True, "AwbEnable": True})
+                # Zero means "auto decides", which also clears the manual
+                # values the ramp pinned. Necessary, but nowhere near
+                # sufficient: the sensor stays on the ramp's multi-second
+                # cadence for another minute or so whatever it is told, so
+                # tell the gateway how long a picture the camera was just
+                # taking and let it hold streaming off until the frames in
+                # flight have drained.
+                #
+                # Trying to flush that cadence here first was measured and
+                # abandoned -- driving the exposure back down manually and
+                # waiting 20s for it left the camera on 15s frames anyway,
+                # and cost every night capture those 20 seconds for nothing.
+                picam2.set_controls({
+                    "AeEnable": True,
+                    "AwbEnable": True,
+                    "ExposureTime": 0,
+                    "AnalogueGain": 0.0,
+                })
+                if last_manual_exposure_us:
+                    stream_gateway.note_long_exposure(last_manual_exposure_us)
             except Exception:
                 pass
+        if held:
+            stream_gateway.camera_lock.release()
 
 
 # =============================================================================
