@@ -446,6 +446,24 @@ MAX_EXPOSURE_US = 15_000_000
 # Acceptable mean-luma band for a manual exposure, and what we aim for when
 # correcting. Deliberately wide -- this is a "not blown out, not black"
 # check, not an attempt to art-direct every frame.
+#
+# Narrowing it to [105, 155] to steady the dawn was tried and REJECTED on
+# the numbers, so don't reach for it again without new evidence:
+#
+#  - It is not free at night, contrary to how it looks. The ramp does not
+#    land on the 15s rail, it lands at 14.41s (the correction from 72 gives
+#    7.96 x 130/72), so the "corrected == exposure, break" shortcut never
+#    fires. Rejecting 91 there buys one more 15s attempt -- tens of seconds
+#    added to every night capture, which is also time the live stream
+#    cannot have the camera -- in exchange for luma 92 instead of 91.
+#  - And it barely moves the thing it was for. Replayed over one real dawn:
+#    mean frame-to-frame jump 19.6 -> 18.3, largest jump 35 -> 35.
+#
+# The dawn wobble is not this band. Consecutive captures are five minutes
+# apart and the scene roughly DOUBLES in brightness between them, so the
+# 3s probe rung lands somewhere different every cycle. Steadying it needs
+# convergence tight enough to track a moving scene, not a tighter accept
+# window on a single coarse probe.
 BRIGHTNESS_TARGET = 130
 BRIGHTNESS_MIN = 85
 BRIGHTNESS_MAX = 175
@@ -470,6 +488,47 @@ EXPOSURE_PROBE_US = 3_000_000
 # frames consistent -- an exposure that stops at a different point each
 # time is exactly what produced a strobe in the timelapse.
 MAX_EXPOSURE_ATTEMPTS = 5
+# Sizing the settle wait -- see the budget in the ramp.
+#
+# The old sizing, (previous + target) x 2 + 5s, under-counted what actually
+# has to happen. Several requests are already queued in the pipeline and
+# they run at the exposure in force when they were QUEUED, so that many old
+# frames have to drain before one at the new setting can even appear. Five
+# is what the drain measured at: coming off a 15s exposure took ~73s.
+#
+# Measured failures under the old sizing, all from one dawn: 3.00s -> 8.34s
+# got 28s and needed more; 3.00s -> 1.89s got 15s; 1.89s -> 1.17s got 11s;
+# 1.17s -> 0.72s got 9s. Every one timed out and metered a stale frame, and
+# the corrections computed from those readings were nonsense -- exposure
+# fell 3.00s -> 1.89s -> 1.17s while the brightness they returned went UP,
+# 206 -> 210 -> 213. That is what produced the one visibly wrong frame of
+# the morning.
+#
+# Raising these is close to free: _await_exposure() returns the moment the
+# camera reports the target, so a bigger budget costs nothing when the
+# settle works and only extends the case that is currently broken.
+#
+# The DRAIN term is the one that was missing, and the split is deliberate.
+# Where the timeouts actually land was measured over 20 hours: 95 of 100
+# fall between 20:00 and midnight and only 5 at dawn. The night ones are
+# benign -- the ramp climbs 3s -> 8s -> 15s, a stale reading there is
+# merely UNDEREXPOSED, and the correction lands on the same ~14.4s either
+# way -- so there is nothing to buy by making that path slower, and real
+# harm in doing so, since a longer capture is time the live stream cannot
+# have the camera. Going DOWN is the dangerous direction: the frames still
+# draining are long compared to the target, a stale reading is
+# OVEREXPOSED, and correcting from it is what produced the 206 -> 210 ->
+# 213 nonsense while the exposure was being cut. Hence generous on drain,
+# frugal on the settle itself.
+PIPELINE_DRAIN_FRAMES = 5
+SETTLE_FRAMES = 2
+SETTLE_MARGIN_S = 5.0
+# ...and because those budgets can now be large, a hard ceiling on the whole
+# ramp. Five attempts at a worst-case budget would otherwise outrun the
+# 5-minute cycle and start eating the next capture's slot. On expiry the
+# ramp stops and keeps the best frame it has, which is strictly what it
+# would have returned anyway.
+RAMP_BUDGET_S = 200.0
 # How long a capture waits for the live stream to hand the camera back.
 # Generous: the gateway's own hold is bounded by a few seconds of session
 # setup, so this only ever expires if something is genuinely stuck.
@@ -605,7 +664,19 @@ def capture_image_to_memory():
         exposure = int(max(MIN_EXPOSURE_US, min(MAX_EXPOSURE_US, exposure)))
 
         image_bytes = None
+        # The frame closest to BRIGHTNESS_TARGET seen so far, and its
+        # brightness. Returning the LAST attempt instead of the best one is
+        # only ever right by luck: the loop leaves through several exits
+        # (out of attempts, out of time, correction pinned at a rail) and
+        # none of them means the final frame was the good one. Tracking the
+        # best is also what makes the narrower accept band safe -- refining
+        # further can then only move the result toward the target, never
+        # away from it.
+        best_image = None
+        best_brightness = None
+        best_exposure = None
         previous_exposure = auto_exposure
+        ramp_deadline = time.monotonic() + RAMP_BUDGET_S
         for attempt in range(MAX_EXPOSURE_ATTEMPTS):
             picam2.set_controls({
                 "AeEnable": False,
@@ -613,10 +684,15 @@ def capture_image_to_memory():
                 "AnalogueGain": target_gain,
             })
             # Wait for the pipeline to actually be producing frames at this
-            # exposure. The budget has to cover flushing whatever frame is
-            # already in flight at the PREVIOUS (possibly much longer)
-            # exposure, plus taking a fresh one at the new setting.
-            settle_budget = (previous_exposure + exposure) / 1_000_000 * 2 + 5
+            # exposure: the queued requests have to drain at the PREVIOUS
+            # exposure before one taken at the new setting can appear. See
+            # PIPELINE_DRAIN_FRAMES.
+            settle_budget = (
+                PIPELINE_DRAIN_FRAMES * previous_exposure / 1_000_000
+                + SETTLE_FRAMES * exposure / 1_000_000
+                + SETTLE_MARGIN_S
+            )
+            settle_budget = min(settle_budget, max(0.0, ramp_deadline - time.monotonic()))
             if not _await_exposure(picam2, exposure, settle_budget):
                 logger.warning(
                     f"Camera never settled at {exposure / 1_000_000:.2f}s "
@@ -635,7 +711,24 @@ def capture_image_to_memory():
                 f"@ {exposure / 1_000_000:.2f}s gain={target_gain:.1f} "
                 f"-> brightness {brightness:.0f}"
             )
+            if brightness < BRIGHTNESS_CLIPPED and (
+                best_brightness is None
+                or abs(brightness - BRIGHTNESS_TARGET)
+                < abs(best_brightness - BRIGHTNESS_TARGET)
+            ):
+                best_image = image_bytes
+                best_brightness = brightness
+                best_exposure = exposure
+
             if BRIGHTNESS_MIN <= brightness <= BRIGHTNESS_MAX:
+                break
+
+            if time.monotonic() >= ramp_deadline:
+                logger.warning(
+                    f"Exposure ramp out of time after {RAMP_BUDGET_S:.0f}s "
+                    f"(brightness {brightness:.0f}) -- keeping the best frame "
+                    f"so far rather than running into the next capture"
+                )
                 break
 
 
@@ -677,11 +770,46 @@ def capture_image_to_memory():
                 break  # already at a rail, further attempts change nothing
             exposure = corrected
 
-        if brightness >= BRIGHTNESS_CLIPPED:
-            # Every manual attempt still came back blown out. Rather than
-            # store the solid-white frame this whole change exists to
-            # prevent, hand the scene back to auto-exposure: a noisy but
-            # legible frame beats a burned one in the timelapse.
+        # Hand back the best frame unless what we are holding is genuinely a
+        # burned one.
+        #
+        # "Best" is only allowed to override the auto fallback when it is
+        # actually in band. Merely being un-clipped is too weak a test: a
+        # scene that blew out on later attempts can leave an early frame at
+        # luma 29, which is the near-black the lower bound exists to reject,
+        # and returning that instead of letting auto-exposure have a go
+        # would be worse than the behaviour this replaced.
+        have_good_frame = (
+            best_brightness is not None
+            and BRIGHTNESS_MIN <= best_brightness <= BRIGHTNESS_MAX
+        )
+        if brightness < BRIGHTNESS_CLIPPED or have_good_frame:
+            # Whatever exit the loop took, hand back its closest-to-target
+            # frame rather than whichever one happened to be last.
+            image_bytes = best_image
+            brightness = best_brightness
+            # Report what the returned frame actually WAS. This used to log a
+            # fresh capture_metadata() reading taken after the fact, which is
+            # a different frame -- it showed "8.19s" for an image the ramp had
+            # accepted at 15.00s, and cost a full frame (up to 15 seconds at
+            # night) to fetch a number that was wrong anyway.
+            logger.info(
+                f"Image captured ({len(image_bytes) / 1024:.1f} KB, "
+                f"{best_exposure / 1_000_000:.2f}s, gain={target_gain:.1f}, "
+                f"brightness {brightness:.0f})"
+            )
+            return image_bytes
+        else:
+            # We are holding a blown-out frame and nothing usable to put in
+            # its place. Rather than store the solid-white frame this whole
+            # change exists to prevent, hand the scene back to
+            # auto-exposure: a noisy but legible frame beats a burned one in
+            # the timelapse.
+            #
+            # The `have_good_frame` escape above is the only change here: a
+            # mid-ramp attempt that landed squarely in band, followed by a
+            # final one that clipped, used to send that good frame to the
+            # bin and pay for an auto capture for no reason.
             logger.warning(
                 f"Manual exposure still clipped after {MAX_EXPOSURE_ATTEMPTS} "
                 f"attempts (brightness {brightness:.0f}) -- falling back to auto"
