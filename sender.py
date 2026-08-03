@@ -529,54 +529,6 @@ SETTLE_MARGIN_S = 5.0
 # ramp stops and keeps the best frame it has, which is strictly what it
 # would have returned anyway.
 RAMP_BUDGET_S = 200.0
-# How stale the seed exposure may be before we stop trusting it. See
-# _seed_exposure(). Two cycles, so one missed capture is survivable and a
-# long gap -- a restart, an outage, or simply the whole daylit day between
-# one dusk and the next -- falls back to metering the scene from scratch.
-SEED_MAX_AGE_S = 11 * 60
-
-# The exposure the last low-light capture settled on, and when. Deliberately
-# in memory only: a restart forgets it and the next capture meters from
-# scratch, which is exactly the old behaviour.
-_last_manual_exposure = None
-
-
-def _seed_exposure():
-    """Where to start the manual ramp: what the last capture settled on.
-
-    Auto-exposure's own reading is close to useless as a starting point in
-    the dark, because the AGC pins gain and picks a short exposure rather
-    than a long one -- metered 0.02s where the answer turned out to be
-    1.35s, out by seventy times. So every night capture spent three attempts
-    rediscovering that the answer is the same ~15s as the last one, at 75
-    seconds a capture, and that is time the camera is not available to the
-    live stream either.
-
-    Five minutes earlier is a far better guess, measured: through the night
-    the settled exposure does not move at all (median change between
-    consecutive captures x1.00), and even through dawn and dusk it changes
-    by x2.2 typically and x7 at worst -- inside what a single proportional
-    correction absorbs. It also keeps the ramp OUT of the near-black regime
-    where the coarse 3s probe rung fires, which is what threw one dusk frame
-    to luma 134 between neighbours at 91 and 82.
-
-    Returns None when there is nothing recent enough to trust, and the
-    caller then does exactly what it did before.
-    """
-    if _last_manual_exposure is None:
-        return None
-    exposure_us, stamped = _last_manual_exposure
-    if time.monotonic() - stamped > SEED_MAX_AGE_S:
-        return None
-    return exposure_us
-
-
-def _remember_exposure(exposure_us):
-    """Cleared, not kept, when a capture ends up with no usable manual
-    exposure -- seeding the next one from a ramp that failed would spread
-    the failure rather than contain it."""
-    global _last_manual_exposure
-    _last_manual_exposure = (exposure_us, time.monotonic()) if exposure_us else None
 # How long a capture waits for the live stream to hand the camera back.
 # Generous: the gateway's own hold is bounded by a few seconds of session
 # setup, so this only ever expires if something is genuinely stuck.
@@ -711,24 +663,6 @@ def capture_image_to_memory():
         exposure = auto_exposure * auto_gain / target_gain
         exposure = int(max(MIN_EXPOSURE_US, min(MAX_EXPOSURE_US, exposure)))
 
-        # ...unless the last capture left a recent answer, which beats
-        # metering from scratch -- see _seed_exposure().
-        #
-        # Note this is NOT the "jump to the ceiling" mistake described above.
-        # That version inferred darkness from a pinned gain reading and
-        # committed to 15s on a scene it had never looked at. This starts
-        # from an exposure that produced a good frame of THIS scene five
-        # minutes ago, and every guard below still applies to it: the frame
-        # is measured, corrected, and can be walked in either direction.
-        seed = _seed_exposure()
-        if seed is not None:
-            logger.debug(
-                f"Seeding ramp at {seed / 1_000_000:.2f}s (last capture's "
-                f"exposure) instead of the {exposure / 1_000_000:.2f}s "
-                f"derived from auto"
-            )
-            exposure = seed
-
         image_bytes = None
         # The frame closest to BRIGHTNESS_TARGET seen so far, and its
         # brightness. Returning the LAST attempt instead of the best one is
@@ -854,7 +788,6 @@ def capture_image_to_memory():
             # frame rather than whichever one happened to be last.
             image_bytes = best_image
             brightness = best_brightness
-            _remember_exposure(best_exposure)
             # Report what the returned frame actually WAS. This used to log a
             # fresh capture_metadata() reading taken after the fact, which is
             # a different frame -- it showed "8.19s" for an image the ramp had
@@ -881,7 +814,6 @@ def capture_image_to_memory():
                 f"Manual exposure still clipped after {MAX_EXPOSURE_ATTEMPTS} "
                 f"attempts (brightness {brightness:.0f}) -- falling back to auto"
             )
-            _remember_exposure(None)
             picam2.set_controls({"AeEnable": True})
             # Same stale-frame trap as above, and the original 1.5s sleep
             # walked straight into it: the fallback frame came back at the
