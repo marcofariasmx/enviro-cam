@@ -929,8 +929,12 @@ def push_single_image(config, entry):
         files = {"image": ("capture.jpg", entry["image_bytes"], "image/jpeg")}
         data = {
             "device_id": entry["device_id"],
-            "timestamp": entry["timestamp"]
+            "timestamp": entry["timestamp"],
         }
+        # Optional: absent from anything queued before this field existed,
+        # and the receiver treats it as optional too.
+        if entry.get("luma") is not None:
+            data["luma"] = entry["luma"]
         # Longer timeout for image upload on unstable network
         response = requests.post(url, files=files, data=data, headers=headers, timeout=120)
         response.raise_for_status()
@@ -1126,10 +1130,27 @@ def run_once(config: dict):
     # Capture and queue image (directly to memory, no SD write)
     image_bytes = capture_image_to_memory()
     if image_bytes:
+        # Mean luma of the frame we are about to send, measured HERE because
+        # this Pi already holds the decoded bytes and has the headroom for it
+        # -- main-pi5 would have to re-read and re-decode the JPEG off disk,
+        # and it is the saturated machine of the two.
+        #
+        # It is what lets the timelapse be de-flickered downstream: the
+        # player smooths this curve over time and corrects each frame toward
+        # it, which is how the field actually solves day/night transitions.
+        # In-camera exposure ramping cannot -- the correction needs to see
+        # frames AFTER the one being corrected, and at capture time they do
+        # not exist yet.
+        try:
+            luma = round(_mean_brightness(image_bytes), 2)
+        except Exception as e:
+            logger.warning(f"Could not measure image luma: {e}")
+            luma = None
         image_entry = {
             "device_id": device_id,
             "timestamp": timestamp,
-            "image_bytes": image_bytes
+            "image_bytes": image_bytes,
+            "luma": luma,
         }
         queue_image(image_entry)
 
