@@ -57,6 +57,9 @@ MAX_IMAGE_QUEUE = 288    # ~24 hours at 5-min intervals (~60-150 MB RAM)
 
 # Global sensor instance (reuse to keep heater stable)
 _sensor = None
+# When the BME680 last started running continuously. Used to tell the
+# receiver how long the plate has been hot -- see sensor_uptime_s().
+_sensor_started_monotonic = None
 
 # Global camera instance (reuse to avoid repeated init)
 _picam2 = None
@@ -117,6 +120,8 @@ def init_sensor():
         _sensor.set_gas_heater_temperature(320)
         _sensor.set_gas_heater_duration(150)
         _sensor.select_gas_heater_profile(0)
+        global _sensor_started_monotonic
+        _sensor_started_monotonic = time.monotonic()
 
         return _sensor
 
@@ -249,6 +254,40 @@ def get_camera_light_data():
     return out
 
 
+def sensor_uptime_s():
+    """How long the BME680 has been powered AND heated without interruption.
+
+    The receiver needs this to know when a reading is a cold start. It used
+    to infer that from gaps in the stored history, and on 2026-08-18 that
+    failed exactly as you would expect: the Pi rebooted at 20:02 UTC, was
+    back inside seven minutes, and left a nine-minute hole -- indistinguishable
+    from the ordinary missed collection cycle that happens dozens of times a
+    month. The two readings that followed came off a cold plate and scored as
+    the worst air of the fortnight. A gap simply cannot carry this
+    information; the sender can, for free.
+
+    Returns the smaller of two clocks, because either event restarts the
+    warm-up:
+
+      - system uptime -- the chip runs off the Pi's 3.3 V rail, so a reboot
+        is a power cut to the sensor,
+      - time since this process configured the heater -- a service restart
+        leaves the chip powered but the heater off in between.
+
+    None if neither clock is readable, which the receiver treats as "no
+    information" and falls back to its gap heuristic.
+    """
+    clocks = []
+    try:
+        with open("/proc/uptime") as fh:
+            clocks.append(float(fh.readline().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
+    if _sensor_started_monotonic is not None:
+        clocks.append(time.monotonic() - _sensor_started_monotonic)
+    return round(min(clocks), 1) if clocks else None
+
+
 def get_local_sensor_data():
     """Read data from local BME680 sensor."""
     sensor = init_sensor()
@@ -282,6 +321,7 @@ def get_local_sensor_data():
             "pressure": round(sensor.data.pressure, 2),
             "air_quality": None,
             "gas_resistance": None,
+            "sensor_uptime_s": sensor_uptime_s(),
         }
 
         if heat_stable and sensor.data.gas_resistance:
