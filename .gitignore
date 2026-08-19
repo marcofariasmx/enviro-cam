@@ -6,3 +6,4 @@ __pycache__/
 sensor_history.db
 sender_config.json
 esp32_known_ips.json
+.watchdog_env

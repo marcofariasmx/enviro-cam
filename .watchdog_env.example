@@ -1,0 +1,18 @@
+# Config for bme680_latch_watchdog.py. Copy to .watchdog_env (gitignored --
+# it holds the agent token) and fill in. Without AGENT_URL the watchdog still
+# detects a latch and shuts the Pi down, it just cannot ask for the power cut,
+# which leaves the Pi off until someone intervenes.
+
+# steren-control agent that owns cam-pi's Steren plug. cam-pi cannot cut its
+# own power, so the agent runs on a DIFFERENT ranch Pi and does the cycle.
+AGENT_URL=http://<agent-host>:8095/recover-campi
+AGENT_TOKEN=
+
+# Consecutive silent 5-minute runs before declaring the I2C bus latched.
+# Three (~15 min) rather than one: a single miss is usually bus contention
+# with sender.py, not a latch.
+FAIL_THRESHOLD=3
+
+# Local floor between recovery attempts. The agent rate-limits independently;
+# both guards exist so a genuinely dead sensor cannot loop the power forever.
+RECOVER_MIN_INTERVAL_H=12

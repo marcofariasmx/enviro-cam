@@ -1,0 +1,8 @@
+[Unit]
+Description=BME680 latch-up watchdog (detects I2C latch, triggers Steren power-cycle recovery)
+After=network-online.target sensor-sender.service
+
+[Service]
+Type=oneshot
+User=mafx
+ExecStart=/home/mafx/enviro-cam/venv/bin/python /home/mafx/enviro-cam/bme680_latch_watchdog.py

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run BME680 latch-up watchdog every 5 min
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

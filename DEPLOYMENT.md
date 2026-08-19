@@ -16,6 +16,7 @@ Production deployment of enviro-cam on a Raspberry Pi 4 in a remote cabin (ranch
 |------|--------|---------|
 | `enviro-cam.service` | this repo (`app.py`) | FastAPI dashboard + MJPEG stream on :8080 |
 | `sensor-sender.service` | this repo (`sender.py`) | Every 5 min: read BME680, snap camera, discover ESP32s, POST to remote receiver |
+| `bme680-latch-watchdog.timer` | this repo (`bme680_latch_watchdog.py`) | Every 5 min: checks the BME680 answers on I2C; on a confirmed latch, asks for a power cycle and shuts down |
 | `net-watchdog.timer` | system-level (see below) | Watchdog that recovers from stuck WiFi states |
 | `tailscaled.service` | tailscale package | Remote access tunnel |
 
@@ -32,6 +33,46 @@ sudo systemctl enable --now sensor-sender
 ```
 
 `esp32_known_ips.json` is also gitignored — it's runtime state, populated by the discovery loop.
+
+## BME680 latch-up watchdog
+
+The BME680 has latched its I2C bus twice — it stops answering entirely and
+nothing short of removing power brings it back. A reboot does not do it: the
+3.3 V rail stays up across a reboot, so the chip stays latched. Only cutting
+power works.
+
+The Pi cannot cut its own power, which is the whole shape of this thing: the
+watchdog detects the latch here, asks a `steren-control` agent on another
+ranch Pi to cycle cam-pi's Steren plug, and then shuts itself down cleanly so
+the agent's cut lands on a Pi that is already off.
+
+```bash
+cp .watchdog_env.example .watchdog_env   # gitignored: holds the agent token
+# fill in AGENT_URL and AGENT_TOKEN
+sudo cp bme680-latch-watchdog.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bme680-latch-watchdog.timer
+```
+
+Detection reads the chip-id register (0x77 / 0xD0, expects 0x61) directly over
+I2C — no sudo needed, the user is in the `i2c` group. Two guards keep a dead
+sensor from cycling the power forever:
+
+- **Three consecutive silent runs (~15 min)** before declaring a latch. One
+  miss is usually bus contention with `sender.py`'s own read, not a latch, and
+  each check already retries three times internally.
+- **A 12-hour floor between recovery attempts**, held in
+  `~/.bme680_latch_watchdog.json`. The agent rate-limits independently, so
+  neither side alone can run away.
+
+The agent call is best-effort: if it fails the Pi still shuts down, because
+the health alert from main-pi5 will surface a Pi that stopped reporting far
+more reliably than one that is up with a dead sensor.
+
+Being `Type=oneshot` on a timer, **`inactive (dead)` is its healthy state** —
+the same trap that made `net-watchdog` show a permanent red DOWN on the fleet
+dashboard. Check `systemctl list-timers bme680-latch-watchdog.timer`, not
+`is-active`.
 
 ## Network watchdog (system-level, not in this repo)
 
